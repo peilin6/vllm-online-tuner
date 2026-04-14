@@ -1,9 +1,9 @@
 # vLLM 在线推理服务性能评测与优化
 
-基于 vLLM 的大语言模型在线推理性能评测工程（毕业设计项目）。在 RTX 4060 Laptop GPU (8GB) + WSL2 环境下，对 Qwen2.5-3B-Instruct-AWQ 模型进行系统化的推理性能基准测试与优化研究。
+基于 vLLM 的大语言模型在线推理性能评测工程（毕业设计项目）。对 Qwen2.5-3B-Instruct-AWQ 模型进行系统化的推理性能基准测试与优化研究。
 
-> **硬件**: RTX 4060 Laptop GPU (8GB VRAM) + CUDA 12.4  
-> **运行环境**: WSL2 (Ubuntu 22.04) — 所有脚本均在 WSL2 内执行  
+> **硬件**: NVIDIA GPU (≥8GB VRAM) + CUDA 12.x  
+> **运行环境**: Linux (Ubuntu 20.04/22.04 推荐，WSL2 亦可)  
 > **模型**: Qwen/Qwen2.5-3B-Instruct-AWQ (AWQ 4-bit 量化, ~2.69GB)  
 > **框架**: vLLM 0.6.6 + PyTorch 2.5.1
 
@@ -64,7 +64,7 @@ vlllm/
 │   │   ├── setup_env.sh            #     环境初始化（含验证）
 │   │   └── download_model.sh       #     从 hf-mirror 下载模型
 │   ├── server/                     #   服务启停与健康检查
-│   │   ├── launch_server.sh        #     启动 vLLM 服务（推荐，WSL2 适配）
+│   │   ├── launch_server.sh        #     启动 vLLM 服务（推荐）
 │   │   ├── start_server.sh         #     启动 vLLM 服务（从 JSON 读配置 + 后台）
 │   │   ├── stop_server.sh          #     停止 vLLM 服务
 │   │   └── _check_health.sh        #     快速健康检查
@@ -106,39 +106,31 @@ vlllm/
 
 | 条件 | 要求 | 检查命令 |
 |------|------|----------|
-| 操作系统 | Windows 10/11 + WSL2 (Ubuntu 22.04) | `wsl --list --verbose` |
+| 操作系统 | Linux (Ubuntu 20.04/22.04 推荐) | `lsb_release -a` |
 | GPU | NVIDIA GPU, ≥8GB VRAM | `nvidia-smi` |
-| CUDA Driver | ≥525.60 (支持 CUDA 12.x) | `nvidia-smi` 右上角显示 |
-| Python | 3.10.x (WSL2 内) | `python3 --version` |
+| CUDA Driver | ≥525.60 (支持 CUDA 12.x) | `nvidia-smi` |
+| Python | 3.10.x | `python3 --version` |
 | python3-venv | 已安装 | `sudo apt install python3.10-venv` |
 | 磁盘空间 | ≥10GB（模型 2.69GB + 依赖 ~5GB） | `df -h` |
 
-### 安装 WSL2（如未安装）
+> **Windows 用户**: 请通过 WSL2 (Ubuntu 22.04) 运行本项目。安装方式：`wsl --install -d Ubuntu-22.04`
 
-```powershell
-# 在 Windows PowerShell (管理员) 中运行
-wsl --install -d Ubuntu-22.04
-```
-
-### 确认 GPU 在 WSL2 中可用
+### 确认 GPU 可用
 
 ```bash
-# 在 WSL2 Ubuntu 终端中
 nvidia-smi
 ```
 
-如果报错，需要安装 [NVIDIA CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/)。
+应能看到 GPU 信息和 CUDA 版本。
 
 ---
 
 ## 快速开始
 
-> 以下所有命令均在 **WSL2 Ubuntu 终端**中执行。
-
 ### 1. 安装环境
 
 ```bash
-cd /mnt/d/vlllm
+cd /path/to/vlllm
 bash scripts/setup/install_all.sh
 ```
 
@@ -154,13 +146,12 @@ pip install 'vllm>=0.6.0,<0.7.0' aiohttp requests numpy pandas pynvml tqdm
 pip install 'transformers>=4.40.0,<4.50.0'
 ```
 
-> **重要**: 虚拟环境必须创建在 WSL2 本地路径（如 `~/vllm-venv`），不要放在 `/mnt/d/` 上。
+> **WSL2 用户注意**: 虚拟环境应创建在 WSL2 本地路径（如 `~/vllm-venv`），不要放在 `/mnt/` 挂载路径上，否则 I/O 会很慢。
 
 ### 2. 下载模型
 
 ```bash
 source ~/vllm-venv/bin/activate
-cd /mnt/d/vlllm
 bash scripts/setup/download_model.sh
 ```
 
@@ -170,16 +161,15 @@ bash scripts/setup/download_model.sh
 
 ```bash
 source ~/vllm-venv/bin/activate
-bash /mnt/d/vlllm/scripts/server/launch_server.sh
+bash scripts/server/launch_server.sh
 ```
 
-启动约 30-60 秒，看到 `Uvicorn running on http://0.0.0.0:8000` 表示成功。服务会占据当前终端，后续操作需**另开一个 WSL2 终端**。
+启动约 30-60 秒，看到 `Uvicorn running on http://0.0.0.0:8000` 表示成功。服务会占据当前终端，后续操作需**另开一个终端窗口**。
 
 ### 4. 验证服务
 
 ```bash
 source ~/vllm-venv/bin/activate
-cd /mnt/d/vlllm
 python3 scripts/verify/verify_server.py
 ```
 
@@ -256,7 +246,6 @@ bash scripts/experiment/run_experiment_suite.sh
 ## 运行测试
 
 ```bash
-cd /mnt/d/vlllm
 source ~/vllm-venv/bin/activate
 python3 -m pytest tests/ -v
 ```
@@ -304,7 +293,7 @@ pip install 'transformers>=4.40.0,<4.50.0'
 </details>
 
 <details>
-<summary><b>Q: WSL2 代理警告 "检测到 localhost 代理配置"</b></summary>
+<summary><b>Q: WSL2 代理警告 "检测到 localhost 代理配置"（仅 WSL2 用户）</b></summary>
 
 不影响使用。如网络不通：
 ```bash
