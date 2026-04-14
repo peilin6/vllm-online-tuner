@@ -1,0 +1,68 @@
+{
+  "config": {
+    "timestamp": "20260410_172651",
+    "model": "Qwen/Qwen2.5-3B-Instruct-AWQ",
+    "concurrency": 1,
+    "num_requests": 3,
+    "request_rate": null,
+    "config_file": "configs/baseline_0.json",
+    "prompts_file": "benchmarks/prompts.json"
+  },
+  "stats": {
+    "total_requests": 3,
+    "successful": 3,
+    "failed": 0,
+    "success_rate": 1.0,
+    "latency_ms": {
+      "min": 372.47348299933947,
+      "max": 23560.87437899987,
+      "mean": 9118.649697999595,
+      "median": 3422.601231999579,
+      "p95": 23560.87437899987,
+      "p99": 23560.87437899987
+    },
+    "throughput_rps": 0.10965705729015203,
+    "ttft_ms": {
+      "min": 61.64963099945453,
+      "max": 20261.74983799865,
+      "mean": 6806.417893665639,
+      "median": 95.85421199881239,
+      "p95": 20261.74983799865
+    },
+    "output_tokens": {
+      "total": 534,
+      "mean": 178
+    },
+    "token_throughput_tps": 19.51895619764706,
+    "wall_time_s": 27.358020305633545
+  },
+  "raw_results": [
+    {
+      "success": true,
+      "ttft_ms": 20261.74983799865,
+      "latency_ms": 23560.87437899987,
+      "output_tokens": 256,
+      "output_tokens_source": "usage",
+      "error": null,
+      "request_id": 2
+    },
+    {
+      "success": true,
+      "ttft_ms": 61.64963099945453,
+      "latency_ms": 3422.601231999579,
+      "output_tokens": 256,
+      "output_tokens_source": "usage",
+      "error": null,
+      "request_id": 1
+    },
+    {
+      "success": true,
+      "ttft_ms": 95.85421199881239,
+      "latency_ms": 372.47348299933947,
+      "output_tokens": 22,
+      "output_tokens_source": "usage",
+      "error": null,
+      "request_id": 0
+    }
+  ]
+}

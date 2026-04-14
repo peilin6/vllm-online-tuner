@@ -1,0 +1,58 @@
+{
+  "workload": {
+    "name": "phase_switch_workload",
+    "seed": 42,
+    "num_requests": 80,
+    "warmup_requests": 5,
+    "cooldown_requests": 5,
+    "arrival": {
+      "pattern": "constant_rate",
+      "rate": 1.0,
+      "options": {}
+    },
+    "prompt": {
+      "source": "pool",
+      "pool_file": "workloads/prompts_pool.json",
+      "length_distribution": {
+        "short": {"range": [20, 100], "weight": 0.3},
+        "medium": {"range": [100, 500], "weight": 0.5},
+        "long": {"range": [500, 1500], "weight": 0.2}
+      }
+    },
+    "output": {
+      "max_tokens_distribution": {
+        "short": {"value": 64, "weight": 0.2},
+        "medium": {"value": 256, "weight": 0.6},
+        "long": {"value": 512, "weight": 0.2}
+      }
+    },
+    "shared_prefix": {
+      "enabled": false,
+      "ratio": 0.0,
+      "prefix_pool_file": "workloads/prefix_pool.json"
+    },
+    "phase_switch": {
+      "enabled": true,
+      "phases": [
+        {
+          "name": "warm_up",
+          "start_time_s": 0,
+          "arrival": {"pattern": "constant_rate", "rate": 1.0},
+          "output": {"max_tokens_distribution": {"medium": {"value": 256, "weight": 1.0}}}
+        },
+        {
+          "name": "burst_phase",
+          "start_time_s": 30,
+          "arrival": {"pattern": "burst"},
+          "output": {"max_tokens_distribution": {"long": {"value": 512, "weight": 1.0}}}
+        },
+        {
+          "name": "cool_down",
+          "start_time_s": 60,
+          "arrival": {"pattern": "constant_rate", "rate": 0.5},
+          "output": {"max_tokens_distribution": {"medium": {"value": 256, "weight": 1.0}}}
+        }
+      ]
+    }
+  }
+}

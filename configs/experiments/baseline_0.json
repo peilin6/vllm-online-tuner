@@ -1,0 +1,40 @@
+{
+  "experiment": {
+    "name": "baseline_0",
+    "description": "第1-2周最小基准实验：固定模型、固定硬件、固定参数，获得首个可复现基准结果（RTX 4060 Laptop 8GB 适配）"
+  },
+  "model": {
+    "name": "Qwen/Qwen2.5-3B-Instruct-AWQ",
+    "dtype": "auto",
+    "quantization": "awq",
+    "max_model_len": 2048,
+    "trust_remote_code": true
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "tensor_parallel_size": 1,
+    "gpu_memory_utilization": 0.90,
+    "max_num_seqs": 32,
+    "enforce_eager": false,
+    "api_type": "openai"
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_tokens": 256,
+    "stop": null
+  },
+  "benchmark": {
+    "num_requests": 50,
+    "concurrency": 1,
+    "request_rate": null,
+    "timeout_per_request": 120
+  },
+  "environment": {
+    "python_version": "3.10",
+    "cuda_version": "12.1+",
+    "vllm_version": "0.6.x",
+    "torch_version": "2.4.x"
+  }
+}

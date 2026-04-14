@@ -1,0 +1,39 @@
+{
+  "workload": {
+    "name": "poisson_workload",
+    "seed": 42,
+    "num_requests": 50,
+    "warmup_requests": 5,
+    "cooldown_requests": 5,
+    "arrival": {
+      "pattern": "poisson",
+      "rate": 2.0,
+      "options": {}
+    },
+    "prompt": {
+      "source": "pool",
+      "pool_file": "workloads/prompts_pool.json",
+      "length_distribution": {
+        "short": {"range": [20, 100], "weight": 0.3},
+        "medium": {"range": [100, 500], "weight": 0.5},
+        "long": {"range": [500, 1500], "weight": 0.2}
+      }
+    },
+    "output": {
+      "max_tokens_distribution": {
+        "short": {"value": 64, "weight": 0.2},
+        "medium": {"value": 256, "weight": 0.6},
+        "long": {"value": 512, "weight": 0.2}
+      }
+    },
+    "shared_prefix": {
+      "enabled": false,
+      "ratio": 0.0,
+      "prefix_pool_file": "workloads/prefix_pool.json"
+    },
+    "phase_switch": {
+      "enabled": false,
+      "phases": []
+    }
+  }
+}

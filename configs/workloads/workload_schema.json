@@ -1,0 +1,148 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Workload Configuration",
+  "description": "vLLM 压测 workload 生成器配置格式定义",
+  "type": "object",
+  "required": ["workload"],
+  "properties": {
+    "workload": {
+      "type": "object",
+      "required": ["name", "seed", "num_requests", "arrival", "prompt", "output"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "workload 名称标识"
+        },
+        "seed": {
+          "type": "integer",
+          "description": "随机种子，保证可复现",
+          "default": 42
+        },
+        "num_requests": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "总请求数"
+        },
+        "warmup_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "预热请求数（统计时排除）"
+        },
+        "cooldown_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "冷却请求数（统计时排除）"
+        },
+        "arrival": {
+          "type": "object",
+          "required": ["pattern"],
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "enum": ["burst", "constant_rate", "poisson"],
+              "description": "请求到达模式"
+            },
+            "rate": {
+              "type": ["number", "null"],
+              "minimum": 0.01,
+              "description": "请求速率 (req/s)，burst 模式下为 null"
+            },
+            "options": {
+              "type": "object",
+              "description": "到达模式的额外选项"
+            }
+          }
+        },
+        "prompt": {
+          "type": "object",
+          "required": ["source", "pool_file"],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["pool"],
+              "description": "prompt 数据来源"
+            },
+            "pool_file": {
+              "type": "string",
+              "description": "prompt 语料池文件路径"
+            },
+            "length_distribution": {
+              "type": "object",
+              "description": "按 prompt 长度 bucket 分布采样",
+              "properties": {
+                "short": {
+                  "type": "object",
+                  "properties": {
+                    "range": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                    "weight": { "type": "number", "minimum": 0, "maximum": 1 }
+                  }
+                },
+                "medium": {
+                  "type": "object",
+                  "properties": {
+                    "range": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                    "weight": { "type": "number", "minimum": 0, "maximum": 1 }
+                  }
+                },
+                "long": {
+                  "type": "object",
+                  "properties": {
+                    "range": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                    "weight": { "type": "number", "minimum": 0, "maximum": 1 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "max_tokens_distribution": {
+              "type": "object",
+              "description": "max_tokens 按权重分布采样",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "value": { "type": "integer", "minimum": 1 },
+                  "weight": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              }
+            }
+          }
+        },
+        "shared_prefix": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "ratio": { "type": "number", "minimum": 0, "maximum": 1, "default": 0 },
+            "prefix_pool_file": { "type": "string" }
+          }
+        },
+        "phase_switch": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "phases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "start_time_s"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "start_time_s": { "type": "number", "minimum": 0 },
+                  "arrival": { "type": "object" },
+                  "prompt": { "type": "object" },
+                  "output": { "type": "object" },
+                  "shared_prefix": { "type": "object" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

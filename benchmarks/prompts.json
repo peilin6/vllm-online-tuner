@@ -1,0 +1,40 @@
+[
+  {
+    "id": "short_01",
+    "messages": [
+      {"role": "user", "content": "请用一句话概括什么是大语言模型。"}
+    ],
+    "description": "短 prompt (~20 tokens)"
+  },
+  {
+    "id": "short_02",
+    "messages": [
+      {"role": "user", "content": "Python 中如何读取 JSON 文件？请给出代码示例。"}
+    ],
+    "description": "短 prompt + 代码生成 (~30 tokens)"
+  },
+  {
+    "id": "medium_01",
+    "messages": [
+      {"role": "system", "content": "你是一个专业的技术助手。"},
+      {"role": "user", "content": "请详细解释 Transformer 中 self-attention 机制的工作原理，包括 Query、Key、Value 的作用，以及 scaled dot-product attention 的计算过程。"}
+    ],
+    "description": "中等 prompt (~80 tokens)"
+  },
+  {
+    "id": "medium_02",
+    "messages": [
+      {"role": "system", "content": "你是一个经验丰富的软件工程师。"},
+      {"role": "user", "content": "我有一个 Python Web 应用，使用 Flask 框架，现在需要添加一个 RESTful API 接口来处理用户注册。请设计这个接口，包括路由、请求参数验证、密码加密存储和错误处理。"}
+    ],
+    "description": "中等 prompt + 代码生成 (~100 tokens)"
+  },
+  {
+    "id": "long_01",
+    "messages": [
+      {"role": "system", "content": "你是一个数据分析专家。请提供详细的分析和建议。"},
+      {"role": "user", "content": "我们公司是一家电商平台，最近三个月的用户活跃度出现了下降趋势。月活用户从 500 万下降到了 420 万，日均订单量从 12 万下降到 9.5 万。用户反馈主要集中在以下几个方面：1）页面加载速度变慢；2）搜索结果不够精准；3）推荐商品重复度高；4）优惠活动减少。请从数据分析的角度，帮我制定一个系统性的排查和优化方案，包括需要关注的核心指标、可能的原因分析框架，以及具体的改进建议。"}
+    ],
+    "description": "长 prompt (~200 tokens)"
+  }
+]

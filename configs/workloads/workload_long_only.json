@@ -1,0 +1,37 @@
+{
+  "workload": {
+    "name": "long_only",
+    "seed": 42,
+    "num_requests": 50,
+    "warmup_requests": 5,
+    "cooldown_requests": 5,
+    "arrival": {
+      "pattern": "burst",
+      "rate": null,
+      "options": {}
+    },
+    "prompt": {
+      "source": "pool",
+      "pool_file": "workloads/prompts_pool.json",
+      "length_distribution": {
+        "short": {"range": [20, 100], "weight": 0.0},
+        "medium": {"range": [100, 500], "weight": 0.0},
+        "long": {"range": [500, 1500], "weight": 1.0}
+      }
+    },
+    "output": {
+      "max_tokens_distribution": {
+        "long": {"value": 512, "weight": 1.0}
+      }
+    },
+    "shared_prefix": {
+      "enabled": false,
+      "ratio": 0.0,
+      "prefix_pool_file": "workloads/prefix_pool.json"
+    },
+    "phase_switch": {
+      "enabled": false,
+      "phases": []
+    }
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "version": "1.0",
+  "metadata": {
+    "description": "共享前缀池 — 用于测试 vLLM prefix caching 效果",
+    "total_prefixes": 5
+  },
+  "prefixes": [
+    {
+      "id": "code_assistant",
+      "system_message": "你是一个专业的Python编程助手，擅长代码审查、性能优化和调试。请用简洁准确的语言回答问题，并给出可运行的代码示例。",
+      "user_prefix": "请帮我分析以下代码并给出优化建议：\n",
+      "estimated_prefix_tokens": 65,
+      "suffix_pool": [
+        "def fib(n): return n if n<2 else fib(n-1)+fib(n-2)",
+        "for i in range(1000000): result = sum(range(i))",
+        "data = open('file.txt').read().split('\\n')\nfor line in data:\n    if 'error' in line:\n        print(line)",
+        "import re\npattern = re.compile(r'(\\d+)-(\\d+)-(\\d+)')\nfor s in strings:\n    m = pattern.match(s)\n    if m: results.append(m.groups())"
+      ]
+    },
+    {
+      "id": "sql_expert",
+      "system_message": "你是一个资深的数据库工程师，精通 MySQL、PostgreSQL 和 SQL 优化。请分析用户提供的 SQL 查询，给出性能分析和优化建议。",
+      "user_prefix": "请分析以下 SQL 查询的性能并给出优化方案：\n",
+      "estimated_prefix_tokens": 70,
+      "suffix_pool": [
+        "SELECT * FROM orders WHERE user_id IN (SELECT id FROM users WHERE created_at > '2024-01-01') ORDER BY created_at DESC LIMIT 100;",
+        "SELECT u.name, COUNT(o.id) as order_count, SUM(o.amount) as total FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id HAVING total > 1000;",
+        "SELECT p.name, c.name as category FROM products p JOIN categories c ON p.category_id = c.id WHERE p.price BETWEEN 100 AND 500 AND p.stock > 0 ORDER BY p.sales DESC;"
+      ]
+    },
+    {
+      "id": "api_designer",
+      "system_message": "你是一个 RESTful API 设计专家。请根据用户描述的业务需求，设计符合 REST 规范的 API 接口，包括 URL 路径、HTTP 方法、请求参数、响应格式和错误码。",
+      "user_prefix": "请为以下业务场景设计 RESTful API：\n",
+      "estimated_prefix_tokens": 75,
+      "suffix_pool": [
+        "用户管理模块：支持注册、登录、修改个人信息、修改密码、查看用户列表（管理员）。",
+        "商品库存管理：支持商品增删改查、库存扣减、库存预警、批量导入。",
+        "在线考试系统：支持创建试卷、随机组卷、学生答题、自动判分、成绩统计。",
+        "博客平台：支持文章发布、编辑、删除、评论、点赞、标签分类、全文搜索。"
+      ]
+    },
+    {
+      "id": "math_tutor",
+      "system_message": "你是一位耐心的数学辅导老师，擅长用通俗的语言解释复杂的数学概念。请一步一步地引导学生理解和解决问题，展示详细的推导过程。",
+      "user_prefix": "请详细解答以下数学问题：\n",
+      "estimated_prefix_tokens": 65,
+      "suffix_pool": [
+        "求函数 f(x) = x^3 - 3x^2 + 2x 的极值点和拐点。",
+        "证明：对任意正整数 n，1^2 + 2^2 + 3^2 + ... + n^2 = n(n+1)(2n+1)/6。",
+        "求不定积分 ∫ x·e^x dx。",
+        "一个盒子里有 5 个红球和 3 个白球，不放回地取 3 个球，求恰好取到 2 个红球的概率。"
+      ]
+    },
+    {
+      "id": "devops_helper",
+      "system_message": "你是一名经验丰富的 DevOps 工程师，精通 Docker、Kubernetes、CI/CD、监控和自动化运维。请根据用户的基础设施问题，给出详细的解决方案和配置示例。",
+      "user_prefix": "请帮我解决以下运维问题：\n",
+      "estimated_prefix_tokens": 70,
+      "suffix_pool": [
+        "我的 Kubernetes Pod 频繁 OOMKilled，内存 limit 设为 512Mi，实际峰值约 480Mi。如何排查和解决？",
+        "需要为一个 Node.js 微服务配置 Dockerfile 和 docker-compose.yml，要求多阶段构建、非 root 用户运行、健康检查。",
+        "GitLab CI 流水线运行太慢（15分钟），主要瓶颈在 npm install 和单元测试。如何优化？",
+        "需要配置 Prometheus + Grafana 监控一组 Redis 集群（3主3从），关注内存使用率、命中率、慢查询。"
+      ]
+    }
+  ]
+}

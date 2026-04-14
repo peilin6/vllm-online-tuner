@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+logs/*.log
+logs/server.pid
+
+# Results (keep structure, ignore large raw data)
+results/*.jsonl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+~$*
+
+# Model weights (too large for git)
+models/
+
+# Personal documents
+*.doc
+*.docx

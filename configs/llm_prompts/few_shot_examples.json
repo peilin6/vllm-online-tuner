@@ -1,0 +1,94 @@
+{
+  "_description": "LLM Advisor 的 few-shot 示例数据，基于 baseline 实测值。后续以真实实验数据更新。",
+  "_generated_from": ["workload_baseline.json", "workload_rate2.json", "workload_long_only.json"],
+  "examples": [
+    {
+      "scenario": "burst_mixed",
+      "description": "突发混合长度请求，baseline 配置，concurrency=1",
+      "workload": {
+        "name": "baseline_workload",
+        "arrival_pattern": "burst",
+        "num_requests": 50,
+        "prompt_distribution": "mixed (short 30%, medium 50%, long 20%)"
+      },
+      "metrics_snapshot": {
+        "throughput_rps": 0.37,
+        "token_throughput_tps": 75.37,
+        "ttft_ms": {"mean": 62.6, "median": 58.0, "p95": 90.8},
+        "tpot_ms": {"mean": 13.5, "median": 12.8, "p95": 18.2},
+        "latency_ms": {"mean": 2717.2, "median": 2650.0, "p95": 3571.1, "p99": 3624.7},
+        "success_rate": 1.0,
+        "output_tokens": {"total": 10240, "mean": 204.8},
+        "gpu_util_pct": 45.0,
+        "mem_used_mib": 5200,
+        "gpu_cache_usage_pct": 0.12
+      },
+      "analysis": {
+        "load_level": "low",
+        "risk_level": "safe",
+        "bottleneck_type": "compute_bound",
+        "dominant_pattern": "batch_underutilized",
+        "state_description": "GPU利用率仅45%，KV cache占用极低(12%)，显存充足。burst模式下concurrency=1使得请求串行处理，吞吐远未饱和。可通过提高并发或加大batch来提升利用率。"
+      }
+    },
+    {
+      "scenario": "constant_rate_moderate",
+      "description": "恒定速率 2 req/s，混合长度请求",
+      "workload": {
+        "name": "constant_rate_2",
+        "arrival_pattern": "constant_rate",
+        "rate": 2.0,
+        "num_requests": 50,
+        "prompt_distribution": "mixed (short 30%, medium 50%, long 20%)"
+      },
+      "metrics_snapshot": {
+        "throughput_rps": 1.85,
+        "token_throughput_tps": 142.5,
+        "ttft_ms": {"mean": 85.0, "median": 72.0, "p95": 165.0},
+        "tpot_ms": {"mean": 14.2, "median": 13.5, "p95": 20.1},
+        "latency_ms": {"mean": 2950.0, "median": 2800.0, "p95": 4200.0, "p99": 4500.0},
+        "success_rate": 1.0,
+        "output_tokens": {"total": 10500, "mean": 210.0},
+        "gpu_util_pct": 72.0,
+        "mem_used_mib": 5800,
+        "gpu_cache_usage_pct": 0.35
+      },
+      "analysis": {
+        "load_level": "medium",
+        "risk_level": "safe",
+        "bottleneck_type": "approaching_capacity",
+        "dominant_pattern": "steady_throughput",
+        "state_description": "GPU利用率72%，KV cache 35%，系统处于中等负载。2 req/s到达率下吞吐已接近稳态。TTFT P95升至165ms说明偶有排队。可考虑小幅增大max_num_seqs以提升并行处理能力。"
+      }
+    },
+    {
+      "scenario": "burst_long_prompts",
+      "description": "突发全长 prompt，max_tokens=512",
+      "workload": {
+        "name": "long_only",
+        "arrival_pattern": "burst",
+        "num_requests": 50,
+        "prompt_distribution": "long only (100%)"
+      },
+      "metrics_snapshot": {
+        "throughput_rps": 0.22,
+        "token_throughput_tps": 110.0,
+        "ttft_ms": {"mean": 120.0, "median": 105.0, "p95": 210.0},
+        "tpot_ms": {"mean": 12.0, "median": 11.5, "p95": 16.8},
+        "latency_ms": {"mean": 5800.0, "median": 5500.0, "p95": 7200.0, "p99": 7800.0},
+        "success_rate": 1.0,
+        "output_tokens": {"total": 25600, "mean": 512.0},
+        "gpu_util_pct": 55.0,
+        "mem_used_mib": 6200,
+        "gpu_cache_usage_pct": 0.52
+      },
+      "analysis": {
+        "load_level": "medium",
+        "risk_level": "warning",
+        "bottleneck_type": "memory_pressure",
+        "dominant_pattern": "long_sequence_heavy",
+        "state_description": "长prompt+高max_tokens导致KV cache占用52%，显存压力中等偏高。单请求延迟高达5.8s，吞吐仅0.22 req/s。TPOT较低说明生成速度尚可，瓶颈在prompt长度导致的prefill开销和KV存储。建议降低max_model_len或启用prefix caching减轻KV压力。"
+      }
+    }
+  ]
+}
