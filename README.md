@@ -1,142 +1,212 @@
-# vLLM 在线推理服务性能评测与优化
+<div align="center">
 
-基于 vLLM 的大语言模型在线推理性能评测工程（毕业设计项目）。对 Qwen2.5-3B-Instruct-AWQ 模型进行系统化的推理性能基准测试与优化研究。
+# ⚡ vLLM Online Inference Benchmark & Optimization
 
-> **硬件**: NVIDIA GPU (≥8GB VRAM) + CUDA 12.x  
-> **运行环境**: Linux (Ubuntu 20.04/22.04 推荐，WSL2 亦可)  
-> **模型**: Qwen/Qwen2.5-3B-Instruct-AWQ (AWQ 4-bit 量化, ~2.69GB)  
-> **框架**: vLLM 0.6.6 + PyTorch 2.5.1
+**基于 vLLM 的大语言模型在线推理服务性能评测与优化系统**
 
----
+[![Python 3.10](https://img.shields.io/badge/Python-3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![vLLM 0.6.x](https://img.shields.io/badge/vLLM-0.6.x-green?logo=v&logoColor=white)](https://github.com/vllm-project/vllm)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.5-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![CUDA 12.x](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![License: Academic](https://img.shields.io/badge/License-Academic-yellow)](./README.md)
 
-## 项目特性
-
-- **异步并发压测引擎** — 基于 aiohttp，支持 Burst / Constant-rate / Poisson 三种请求到达模式
-- **精确指标采集** — TTFT、TPOT、端到端延迟、吞吐量，流式 SSE + `stream_options.include_usage` 精确 token 计数
-- **可编程负载生成** — 支持 prompt 长度分布采样、共享前缀注入（Prefix Caching）、多阶段 Phase-switch 负载切换
-- **实时基础设施监控** — 后台 daemon 线程采集 GPU 利用率/显存/温度/功耗 + vLLM Prometheus `/metrics` 指标
-- **完善的实验配置体系** — 15 个预定义 workload 配置覆盖速率/长度/前缀/突发等多维实验轴
-- **全流程自动化** — 一键环境安装 → 模型下载 → 服务启动 → 验证 → 压测 → 结果汇总
-- **完整单元测试** — 5 个测试模块覆盖压测统计、负载生成、配置校验、监控采集
-
-### Baseline 0 实测结果
-
-| 指标 | 值 |
-|------|-----|
-| 吞吐量 | 0.37 req/s |
-| Token 吞吐 | 75.37 tokens/s |
-| TTFT 均值 / P95 | 62.6 ms / 90.8 ms |
-| 端到端延迟均值 / P95 | 2717.2 ms / 3571.1 ms |
-| 成功率 | 100% |
+</div>
 
 ---
 
-## 目录结构
+## 📖 项目简介
+
+本项目是一个面向 **vLLM 推理框架**的端到端性能评测与优化平台。通过系统化的基准测试，量化分析不同负载模式、请求速率、输入长度和前缀复用策略对在线推理服务的吞吐量与延迟的影响，为 LLM 推理服务的部署优化提供数据支撑和决策依据。
+
+### 🎯 研究目标
+
+- 在固定硬件与模型条件下，建立 **可复现的性能基准线**（Baseline）
+- 通过多维度参数扫描，分析 **请求到达模式**、**输入/输出长度分布**、**共享前缀比例** 对推理性能的影响
+- 探索基于实时监控指标的 **自适应参数调优策略**
+
+### 📊 技术栈
+
+| 层级 | 技术 | 说明 |
+|------|------|------|
+| 推理框架 | [vLLM](https://github.com/vllm-project/vllm) | PagedAttention + Continuous Batching |
+| 模型 | Qwen2.5-3B-Instruct-AWQ | AWQ 4-bit 量化, ~2.69GB |
+| 压测引擎 | aiohttp + asyncio | 异步并发，支持流式 SSE |
+| 监控 | pynvml + Prometheus | GPU 指标 + vLLM 内部指标 |
+| 负载生成 | 自研 WorkloadGenerator | 可编程、可复现的请求序列 |
+
+---
+
+## ✨ 核心特性
+
+<table>
+<tr>
+<td width="50%">
+
+### 🚀 异步并发压测引擎
+- 支持 **Burst / Constant-rate / Poisson** 三种请求到达模式
+- 流式 SSE 解析 + `stream_options.include_usage` 精确 token 计数
+- 可配置并发数、请求速率、超时策略
+
+</td>
+<td width="50%">
+
+### 📈 全链路指标采集
+- **TTFT** — 首 Token 时延
+- **TPOT** — Token 间平均间隔
+- **E2E Latency** — 端到端时延 (Mean / P95 / P99)
+- **Throughput** — 请求吞吐 & Token 吞吐
+
+</td>
+</tr>
+<tr>
+<td>
+
+### 🔧 可编程负载生成
+- Prompt 长度分布采样（短/中/长加权）
+- 共享前缀注入（Prefix Caching 实验）
+- 多阶段 Phase-switch 负载切换
+- 基于 seed 的可复现请求序列
+
+</td>
+<td>
+
+### 📡 实时基础设施监控
+- GPU 利用率 / 显存 / 温度 / 功耗（500ms 采样）
+- vLLM Prometheus `/metrics` 端点采集
+- 运行中/等待请求数、KV Cache 占用率、抢占次数
+
+</td>
+</tr>
+</table>
+
+### 🏆 Baseline 0 实测结果
+
+<table>
+<tr>
+<th>指标</th><th>值</th><th>指标</th><th>值</th>
+</tr>
+<tr>
+<td>🔄 吞吐量</td><td><b>0.37 req/s</b></td>
+<td>⚡ Token 吞吐</td><td><b>75.37 tokens/s</b></td>
+</tr>
+<tr>
+<td>🎯 TTFT 均值</td><td>62.6 ms</td>
+<td>📊 TTFT P95</td><td>90.8 ms</td>
+</tr>
+<tr>
+<td>⏱️ 端到端延迟均值</td><td>2717.2 ms</td>
+<td>📈 端到端延迟 P95</td><td>3571.1 ms</td>
+</tr>
+<tr>
+<td>✅ 成功率</td><td colspan="3"><b>100%</b></td>
+</tr>
+</table>
+
+---
+
+## 🏗️ 系统架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Experiment Config                        │
+│              (baseline_0.json + workload_*.json)                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │   WorkloadGenerator     │
+              │  (burst/rate/poisson)   │
+              └────────────┬────────────┘
+                           │ 请求序列
+              ┌────────────▼────────────┐
+              │   Benchmark Engine      │
+              │  (aiohttp + asyncio)    │
+              │  ┌──────────────────┐   │        ┌──────────────────┐
+              │  │ Streaming SSE    │───┼───────► │  vLLM Server     │
+              │  │ Token Counter    │   │         │  (OpenAI API)    │
+              │  └──────────────────┘   │         └──────────────────┘
+              └────────────┬────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+   ┌────────▼───────┐ ┌───▼──────┐ ┌─────▼─────────┐
+   │  GPU Monitor   │ │  vLLM    │ │   Results      │
+   │  (pynvml)      │ │ Metrics  │ │  (.json/.txt)  │
+   │  500ms sample  │ │ 1s pull  │ │                │
+   └────────────────┘ └──────────┘ └────────────────┘
+```
+
+---
+
+## 📁 目录结构
+
+<details>
+<summary><b>点击展开完整目录</b></summary>
 
 ```
 vlllm/
 ├── benchmarks/                     # 压测执行
 │   ├── run_benchmark.py            #   核心压测脚本（异步并发 + 多模式请求）
 │   └── prompts.json                #   5 条测试 prompt 样本（短/中/长）
-├── monitors/                       # 基础设施监控模块
-│   ├── gpu_monitor.py              #   GPU 利用率/显存/温度/功耗采集（pynvml）
+├── monitors/                       # 基础设施监控
+│   ├── gpu_monitor.py              #   GPU 利用率/显存/温度/功耗采集
 │   └── vllm_metrics_collector.py   #   vLLM Prometheus metrics 采集
 ├── workloads/                      # 负载生成与语料管理
-│   ├── workload_generator.py       #   可编程负载生成器（burst/rate/poisson + 前缀注入）
+│   ├── workload_generator.py       #   可编程负载生成器
 │   ├── prompts_pool.json           #   30+ 条分类 prompt 语料池
-│   └── prefix_pool.json            #   5 组共享前缀模板（代码/SQL/API/数学/DevOps）
+│   └── prefix_pool.json            #   5 组共享前缀模板
 ├── configs/                        # 实验配置
 │   ├── experiments/
-│   │   └── baseline_0.json         #     Baseline 0 完整配置
-│   ├── workloads/                  #   15 个 workload 配置文件
-│   │   ├── workload_baseline.json  #     默认 burst 混合长度
-│   │   ├── workload_rate2/4.json   #     恒定速率 2/4 req/s
-│   │   ├── workload_poisson*.json  #     泊松到达模式
-│   │   ├── workload_*_only.json    #     短/长 prompt 专项
-│   │   ├── workload_prefix_*.json  #     共享前缀比例 0%/50%/90%
-│   │   ├── workload_phase_switch.json  # 多阶段负载切换
-│   │   └── workload_schema.json    #     JSON Schema 定义
+│   │   └── baseline_0.json         #   Baseline 0 完整配置
+│   ├── workloads/                  #   15 个 workload 配置
 │   └── llm_prompts/
-│       └── few_shot_examples.json  #     LLM Advisor few-shot 示例
-├── scripts/                        # 工具脚本集合
+│       └── few_shot_examples.json  #   LLM Advisor few-shot 示例
+├── scripts/                        # 自动化脚本
 │   ├── setup/                      #   环境安装与初始化
-│   │   ├── install_all.sh          #     一键安装 vLLM 及所有依赖
-│   │   ├── setup_env.sh            #     环境初始化（含验证）
-│   │   └── download_model.sh       #     从 hf-mirror 下载模型
 │   ├── server/                     #   服务启停与健康检查
-│   │   ├── launch_server.sh        #     启动 vLLM 服务（推荐）
-│   │   ├── start_server.sh         #     启动 vLLM 服务（从 JSON 读配置 + 后台）
-│   │   ├── stop_server.sh          #     停止 vLLM 服务
-│   │   └── _check_health.sh        #     快速健康检查
 │   ├── experiment/                 #   实验执行
-│   │   ├── run_baseline.sh         #     Baseline 一键流水线
-│   │   ├── run_experiment_suite.sh #     批量实验套件（到达/长度/前缀三轴扫描）
-│   │   └── run_initial_experiments.sh
 │   ├── verify/                     #   验证与检查
-│   │   ├── verify_server.py        #     服务健康+模型可用+生成能力验证
-│   │   ├── verify_week3.sh         #     Week 3 Task 验证
-│   │   └── check_and_run.sh        #     检查服务+启动+运行全套测试
-│   ├── test/                       #   测试
-│   │   ├── run_tests.sh            #     运行单元测试
-│   │   ├── run_all_tests.sh        #     运行全套测试
-│   │   └── test_stream.py          #     快速 streaming 请求测试
-│   └── tools/
-│       └── collect_sysinfo.py      #     系统信息采集（GPU/CPU/CUDA/版本）
-├── tests/                          # 单元测试
-│   ├── test_run_benchmark.py       #   压测统计/格式化/trace 构建
-│   ├── test_workload_generator.py  #   负载生成/到达模式/可复现性
-│   ├── test_configs.py             #   配置完整性/prompt池/prefix池格式
-│   ├── test_gpu_monitor.py         #   GPU 监控生命周期/采样/降级
-│   └── test_vllm_metrics_collector.py  # Prometheus 解析/端点降级
+│   ├── test/                       #   测试脚本
+│   └── tools/                      #   工具脚本
+├── tests/                          # 单元测试（5 个模块）
 ├── docs/                           # 文档
-│   ├── research_scope.md           #   研究范围与参数边界定义
-│   ├── environment_guide.md        #   环境搭建指南
-│   ├── experiment_template.md      #   实验记录模板
-│   ├── phase0_changelog.md         #   Phase 0 修改记录
-│   └── troubleshooting.md          #   常见问题排查
 ├── results/                        # 实验结果
 ├── logs/                           # 运行日志
-├── requirements.txt                # Python 依赖列表
-└── README.md                       # 本文件
+└── requirements.txt                # Python 依赖
 ```
+
+</details>
 
 ---
 
-## 前置条件
+## 🔨 环境要求
 
 | 条件 | 要求 | 检查命令 |
-|------|------|----------|
-| 操作系统 | Linux (Ubuntu 20.04/22.04 推荐) | `lsb_release -a` |
-| GPU | NVIDIA GPU, ≥8GB VRAM | `nvidia-smi` |
-| CUDA Driver | ≥525.60 (支持 CUDA 12.x) | `nvidia-smi` |
-| Python | 3.10.x | `python3 --version` |
-| python3-venv | 已安装 | `sudo apt install python3.10-venv` |
-| 磁盘空间 | ≥10GB（模型 2.69GB + 依赖 ~5GB） | `df -h` |
+|:-----|:-----|:---------|
+| 🖥️ 操作系统 | Linux (Ubuntu 20.04/22.04 推荐) | `lsb_release -a` |
+| 🎮 GPU | NVIDIA GPU, ≥8GB VRAM | `nvidia-smi` |
+| ⚙️ CUDA Driver | ≥525.60 (CUDA 12.x) | `nvidia-smi` |
+| 🐍 Python | 3.10.x | `python3 --version` |
+| 💾 磁盘空间 | ≥10GB | `df -h` |
 
-> **Windows 用户**: 请通过 WSL2 (Ubuntu 22.04) 运行本项目。安装方式：`wsl --install -d Ubuntu-22.04`
-
-### 确认 GPU 可用
-
-```bash
-nvidia-smi
-```
-
-应能看到 GPU 信息和 CUDA 版本。
+> 💡 **Windows 用户**：请通过 WSL2 (Ubuntu 22.04) 运行。安装方式：`wsl --install -d Ubuntu-22.04`
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
-### 1. 安装环境
+### 1️⃣ 安装环境
 
 ```bash
-cd /path/to/vlllm
+# 克隆项目
+git clone https://github.com/peilin6/vllm-online-tuner.git
+cd vllm-online-tuner
+
+# 一键安装（自动创建虚拟环境 + 安装依赖）
 bash scripts/setup/install_all.sh
 ```
 
-脚本会自动在 `~/vllm-venv` 创建 Python 虚拟环境并安装全部依赖。
-
-如需手动安装：
+<details>
+<summary>📋 手动安装</summary>
 
 ```bash
 python3 -m venv ~/vllm-venv
@@ -146,132 +216,149 @@ pip install 'vllm>=0.6.0,<0.7.0' aiohttp requests numpy pandas pynvml tqdm
 pip install 'transformers>=4.40.0,<4.50.0'
 ```
 
-> **WSL2 用户注意**: 虚拟环境应创建在 WSL2 本地路径（如 `~/vllm-venv`），不要放在 `/mnt/` 挂载路径上，否则 I/O 会很慢。
+</details>
 
-### 2. 下载模型
+### 2️⃣ 下载模型
 
 ```bash
 source ~/vllm-venv/bin/activate
 bash scripts/setup/download_model.sh
 ```
 
-模型下载到 `~/models/Qwen2.5-3B-Instruct-AWQ`（~2.69GB，使用 hf-mirror.com 镜像，支持断点续传）。
+> 模型下载到 `~/models/Qwen2.5-3B-Instruct-AWQ`（~2.69GB，hf-mirror.com 镜像，支持断点续传）
 
-### 3. 启动 vLLM 服务
+### 3️⃣ 启动服务
 
 ```bash
 source ~/vllm-venv/bin/activate
 bash scripts/server/launch_server.sh
 ```
 
-启动约 30-60 秒，看到 `Uvicorn running on http://0.0.0.0:8000` 表示成功。服务会占据当前终端，后续操作需**另开一个终端窗口**。
+看到 `Uvicorn running on http://0.0.0.0:8000` 表示启动成功。
 
-### 4. 验证服务
+### 4️⃣ 验证 & 压测
+
+在**另一个终端**中执行：
 
 ```bash
 source ~/vllm-venv/bin/activate
+
+# 验证服务
 python3 scripts/verify/verify_server.py
-```
 
-验证 `/health` 可达、模型已加载、`/v1/chat/completions` 可正常生成。
-
-### 5. 运行基准压测
-
-```bash
+# 运行基准压测
 python3 benchmarks/run_benchmark.py \
     --config configs/experiments/baseline_0.json \
     --host localhost --port 8000
 ```
 
-结果自动保存到 `results/`：
-- `benchmark_<时间戳>.json` — 完整原始数据
-- `benchmark_<时间戳>.txt` — 人可读摘要
-
-### 6. 一键完整流水线（可选）
+### 🔁 一键全流程（可选）
 
 ```bash
 bash scripts/experiment/run_baseline.sh
 ```
 
-自动执行：采集环境信息 → 启动服务 → 验证 → 压测 → 汇总结果。
+> 自动完成：环境信息采集 → 启动服务 → 验证 → 压测 → 结果汇总
 
 ---
 
-## 压测参数说明
+## ⚙️ 实验配置
 
-### Baseline 0 配置 (`configs/experiments/baseline_0.json`)
+### Baseline 0 参数
 
 | 参数 | 值 | 说明 |
-|------|-----|------|
+|:-----|:----|:-----|
 | 请求数 | 50 | 总请求数量 |
 | 并发数 | 1 | 串行发送 |
-| max_tokens | 256 | 单请求最大生成 token 数 |
+| max_tokens | 256 | 单请求最大生成 token |
 | temperature | 0.7 | 采样温度 |
-| 请求模式 | burst | 不限速，尽快发送 |
+| 请求模式 | burst | 不限速发送 |
 
-### 自定义参数
+### 自定义压测
 
 ```bash
-# 调整并发数和请求数
+# 高并发
 python3 benchmarks/run_benchmark.py --concurrency 4 --num-requests 100
 
-# 限速发送 (2 req/s)
+# 限速 (2 req/s)
 python3 benchmarks/run_benchmark.py --request-rate 2.0
 ```
 
-### 批量实验套件
+### 多维度实验套件
 
 ```bash
 bash scripts/experiment/run_experiment_suite.sh
 ```
 
-自动扫描三个实验轴：到达模式 (burst / 2 req/s / 4 req/s / poisson)、prompt 长度分布、共享前缀比例。
+自动扫描 **到达模式** × **prompt 长度** × **前缀比例** 三个实验轴。
+
+### 📋 预定义 Workload 配置
+
+| 配置文件 | 到达模式 | 特点 |
+|:---------|:---------|:-----|
+| `workload_baseline.json` | burst | 混合长度，默认基准 |
+| `workload_rate2.json` | constant 2 req/s | 恒定速率 |
+| `workload_rate4.json` | constant 4 req/s | 高速率 |
+| `workload_poisson.json` | poisson λ=2 | 真实流量模拟 |
+| `workload_short_only.json` | burst | 短 prompt 专项 |
+| `workload_long_only.json` | burst | 长 prompt 专项 |
+| `workload_prefix_50.json` | burst | 50% 共享前缀 |
+| `workload_prefix_90.json` | burst | 90% 共享前缀 |
+| `workload_phase_switch.json` | 多阶段 | 负载动态切换 |
 
 ---
 
-## 核心指标
+## 📏 核心指标
 
 | 指标 | 英文名 | 单位 | 说明 |
-|------|--------|------|------|
-| 吞吐量 | Throughput | req/s | 每秒完成的请求数 |
-| Token 吞吐 | Token Throughput | tokens/s | 每秒生成的 token 数 |
-| 首 Token 时延 | TTFT | ms | 发出请求到收到第一个 token 的时间 |
-| Token 间隔 | TPOT | ms | 输出 token 间的平均间隔 |
-| 端到端时延 | E2E Latency | ms | 发出请求到收到完整回复的时间 |
-| P95 / P99 时延 | P95 / P99 Latency | ms | 尾部延迟 |
-| 成功率 | Success Rate | % | 成功完成的请求占比 |
+|:-----|:-------|:-----|:-----|
+| 🔄 吞吐量 | Throughput | req/s | 每秒完成的请求数 |
+| ⚡ Token 吞吐 | Token Throughput | tokens/s | 每秒生成的 token 数 |
+| 🎯 首 Token 时延 | TTFT | ms | 发出请求到收到第一个 token |
+| ⏱️ Token 间隔 | TPOT | ms | 输出 token 间的平均间隔 |
+| 📊 端到端时延 | E2E Latency | ms | 请求到完整回复的时间 |
+| 📈 尾部延迟 | P95 / P99 | ms | 尾部延迟分位数 |
+| ✅ 成功率 | Success Rate | % | 成功请求占比 |
 
 ---
 
-## 运行测试
+## 🧪 测试
 
 ```bash
 source ~/vllm-venv/bin/activate
 python3 -m pytest tests/ -v
 ```
 
----
-
-## 依赖
-
-| 包名 | 版本要求 | 用途 |
-|------|----------|------|
-| vllm | ≥0.6.0, <0.7.0 | LLM 推理框架 |
-| torch | 随 vllm 安装 | 深度学习框架 |
-| transformers | ≥4.40.0, <4.50.0 | 模型加载 / Tokenizer |
-| aiohttp | ≥3.9.0 | 异步 HTTP 客户端（压测） |
-| requests | ≥2.31.0 | HTTP 客户端（验证） |
-| numpy | ≥1.26.0 | 数据处理 |
-| pandas | ≥2.1.0 | 数据分析 |
-| pynvml | ≥11.5.0 | GPU 监控 |
-| tqdm | ≥4.66.0 | 进度条 |
+| 测试模块 | 覆盖范围 |
+|:---------|:---------|
+| `test_run_benchmark.py` | 统计计算、格式化输出、trace 构建 |
+| `test_workload_generator.py` | 到达模式、prompt 采样、可复现性 |
+| `test_configs.py` | 配置完整性、prompt 池、prefix 池格式 |
+| `test_gpu_monitor.py` | 生命周期、daemon 线程、采样、优雅降级 |
+| `test_vllm_metrics_collector.py` | Prometheus 解析、端点不可用降级 |
 
 ---
 
-## 常见问题
+## 📦 依赖
+
+| 包名 | 版本 | 用途 |
+|:-----|:-----|:-----|
+| `vllm` | ≥0.6.0, <0.7.0 | LLM 推理框架 |
+| `torch` | 随 vllm 安装 | 深度学习框架 |
+| `transformers` | ≥4.40.0, <4.50.0 | 模型加载 / Tokenizer |
+| `aiohttp` | ≥3.9.0 | 异步 HTTP 客户端 |
+| `requests` | ≥2.31.0 | HTTP 客户端 |
+| `numpy` | ≥1.26.0 | 数据处理 |
+| `pandas` | ≥2.1.0 | 数据分析 |
+| `pynvml` | ≥11.5.0 | GPU 监控 |
+| `tqdm` | ≥4.66.0 | 进度条 |
+
+---
+
+## ❓ FAQ
 
 <details>
-<summary><b>Q: python3 -m venv 报错</b></summary>
+<summary><b>python3 -m venv 报错</b></summary>
 
 ```bash
 sudo apt install python3.10-venv -y
@@ -279,7 +366,7 @@ sudo apt install python3.10-venv -y
 </details>
 
 <details>
-<summary><b>Q: transformers 版本不兼容 (all_special_tokens_extended 错误)</b></summary>
+<summary><b>transformers 版本不兼容 (all_special_tokens_extended)</b></summary>
 
 ```bash
 pip install 'transformers>=4.40.0,<4.50.0'
@@ -287,28 +374,25 @@ pip install 'transformers>=4.40.0,<4.50.0'
 </details>
 
 <details>
-<summary><b>Q: OOM — GPU 显存不足</b></summary>
+<summary><b>OOM — GPU 显存不足</b></summary>
 
-8GB VRAM 无法运行 fp16 模型。本项目使用 `Qwen2.5-3B-Instruct-AWQ` (4-bit, ~2.69GB 权重)。如仍 OOM，降低 `gpu_memory_utilization` 或 `max_model_len`。
+本项目使用 AWQ 4-bit 量化模型（~2.69GB）。如仍 OOM，降低 `gpu_memory_utilization` 或 `max_model_len`。
 </details>
 
 <details>
-<summary><b>Q: WSL2 代理警告 "检测到 localhost 代理配置"（仅 WSL2 用户）</b></summary>
+<summary><b>模型下载失败 / DNS 超时</b></summary>
 
-不影响使用。如网络不通：
-```bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-```
+`download_model.sh` 默认使用 hf-mirror.com 镜像，重新运行即可断点续传。
 </details>
 
 <details>
-<summary><b>Q: 模型下载失败 / DNS 超时</b></summary>
+<summary><b>WSL2 代理警告（仅 Windows 用户）</b></summary>
 
-使用 hf-mirror.com 镜像（`download_model.sh` 默认配置）。重新运行脚本会自动断点续传。
+不影响使用。如网络不通：`unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`
 </details>
 
 ---
 
-## License
+## 📄 License
 
-本项目为毕业设计学术用途。
+本项目为毕业设计学术研究用途。
