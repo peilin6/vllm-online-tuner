@@ -28,3 +28,8 @@ models/
 # Personal documents
 *.doc
 *.docx
+
+# Temp scratch files
+tmp_*.txt
+tmp_*.log
+tmp_results.txt

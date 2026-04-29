@@ -1,4 +1,4 @@
-# vLLM 第3-8周执行任务书：LLM 驱动的自主优化 Agent
+﻿# vLLM 第3-8周执行任务书：LLM 驱动的自主优化 Agent
 
 > **用法**：将本文件完整交给 AI 编码助手，让它按 Task 顺序执行。每完成一个 Task 后，让 AI 汇报产出物并等你确认，再继续下一个 Task。
 >
@@ -12,33 +12,42 @@
 
 论文定位：*an autonomous LLM-driven runtime adaptation agent for vLLM inference optimization*。
 
-### 1.1 硬件与环境（已验证，不要更改）
+### 1.1 硬件与环境
+
+**Week 1–4（已完成，历史平台，baseline_0 数据来源）**
 
 | 项目 | 值 |
 |------|-----|
 | GPU | NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB VRAM |
 | 驱动 | 566.26, CUDA 12.4 |
 | OS | Windows + WSL2 (Ubuntu-22.04, kernel 6.6.87.2) |
-| Python | 3.10.12 (WSL2 内, venv 在 ~/vllm-venv) |
-| vLLM | 0.6.6.post1 |
-| PyTorch | 2.5.1+cu124 |
-| transformers | 4.49.0 |
-| 模型 | Qwen/Qwen2.5-3B-Instruct-AWQ (4-bit AWQ, ~2.69GB) |
-| 模型路径 | ~/models/Qwen2.5-3B-Instruct-AWQ |
-| vLLM 服务端口 | 8000 |
-| Proxy 端口 | 9000（Week 5 起） |
+| Python venv | `~/vllm-venv` |
+| 模型 | Qwen/Qwen2.5-3B-Instruct-AWQ (~2.69 GB) |
+| 模型路径 | `~/models/Qwen2.5-3B-Instruct-AWQ` |
+
+**Week 5 起（目标平台，详见 §七 迁移计划）**
+
+| 项目 | 值 |
+|------|-----|
+| GPU | NVIDIA RTX A6000, 48 GB VRAM |
+| 驱动 | ≥ 550, CUDA 12.4 |
+| Python venv | `~/vllm-venv-a6000` |
+| 模型 | Qwen/Qwen3-8B (bf16, ~16 GB) |
+| 模型路径 | `~/models/Qwen3-8B` |
+
+**软件栈（两套平台共用版本）**：vLLM 0.6.6.post1、PyTorch 2.5.1+cu124、transformers 4.49.0、Python 3.10。vLLM 服务端口固定 8000；**本方案不引入 proxy 层**，所有参数调优直接作用于 vLLM engine args（见 §二）。
 
 ### 1.2 关键约束（必须遵守）
 
-1. **所有命令在 WSL2 Ubuntu-22.04 中执行**，虚拟环境在 `~/vllm-venv`
+1. **所有命令在 WSL2 Ubuntu-22.04 中执行**，4060 用 `~/vllm-venv`，A6000 用 `~/vllm-venv-a6000`
 2. **代理问题**：任何使用 Python `requests` 或 `aiohttp` 的脚本都必须在运行前 `export no_proxy="*"`
 3. **PowerShell→WSL 引号问题**：不要在 PowerShell 中内联执行含引号/括号的 Python 命令，务必写成 .sh 脚本再 `wsl -- bash xxx.sh`
-4. **显存限制 8GB**：不要使用 7B fp16 模型，当前只能跑 3B AWQ；**不能同时运行两个 vLLM 实例**
-5. **不修改 vLLM 源码**，只在外部做 workload、proxy、controller
+4. **显存限制**：4060 平台只能跑 3B-AWQ；A6000 平台默认跑 Qwen3-8B bf16（不做量化，见 Task 5.2）；**不能同时运行两个 vLLM 实例**
+5. **不修改 vLLM 源码**，只在外部做 workload 生成、agent 决策与指标采集
 6. **所有新文件使用 UTF-8 编码**
 7. **所有 Python 脚本**开头加 `#!/usr/bin/env python3` 和 `# -*- coding: utf-8 -*-`
 8. **日志输出**使用中文，代码注释使用中文，变量名使用英文
-9. **不要安装不必要的新依赖**，新增依赖仅限 `optuna>=3.6.0` 和 `openai>=1.0.0`
+9. **不要安装不必要的新依赖**，新增依赖仅限 `openai>=1.0.0`、`tiktoken`、`python-dotenv`、`optuna>=3.6.0`、`scipy`（BO / 敏感度分析工具用）
 
 ### 1.3 当前工程结构（第1-4周已完成，含重构）
 
@@ -125,121 +134,258 @@ d:/vlllm/
 
 ## 二、系统架构总览
 
-### 2.1 七模块架构图
+> **设计口径**：本项目**不做 proxy 在线控制**。自 Week 5 起采用 **VTA-Agent**（vLLM Tuning Agent）——一个 **LLM 驱动 + 算法增强** 的闭环调参 agent：
+>
+> - **输入**：vLLM 运行时 metrics（throughput / TTFT / TPOT / KV / preempt / queue）。
+> - **输出**：修改后的 vLLM engine args（一次一改，重启生效）。
+> - **驱动方**：LLM 担任 Diagnoser / Proposer / Reflector / Reporter，**决策每一步该做什么**。
+> - **加速器**：把 **Bayesian Optimization (Optuna TPE)、参数敏感度分析、Pareto 过滤** 等算法封装成 LLM 可调用工具——LLM 不必亲自做数值优化，但可以在合适时机让算法给出建议、再用领域知识审阅/采纳/否决。
+>
+> 即：**LLM 是 orchestrator，算法是 inner-loop tool**。这样既保留 LLM 的语义推理与解释能力，又借力成熟优化算法在数值密集子问题上的效率。
+
+### 2.1 VTA-Agent 闭环架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                Module A: Workload Generator                  │
-│     burst / constant-rate / poisson / phase-switch           │
-│     工具: random.Random(seed) + asyncio + aiohttp            │
-└────────────────────────────┬────────────────────────────────┘
-                             │ POST /v1/chat/completions
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│             Module B: Proxy / Gateway (port 9000)            │
-│  batching_window │ max_concurrency │ admission_threshold     │
-│  /health │ /proxy/metrics │ /internal/config/proxy           │
-│  工具: aiohttp.web + asyncio.Semaphore + asyncio.Queue       │
-└────────────────────────────┬────────────────────────────────┘
-                             │ 转发
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│           vLLM Backend 单实例 (port 8000)                    │
-│    Profile L (低延迟) / B (平衡) / T (高吞吐)                │
-│    通过重启加载不同配置，不并行运行多实例                      │
-└────────────────────────────┬────────────────────────────────┘
-              ┌──────────────┴──────────────────┐
-              ▼                                 ▼
-┌───────────────────────┐       ┌───────────────────────────┐
-│  Module D: Monitor    │       │  Module C: Profile Manager │
-│  pynvml + /metrics    │       │  3 profiles, restart-switch│
-│  + proxy stats        │       │  stop→start→verify (~45s)  │
-│  + request-level      │       └───────────────────────────┘
-└──────────┬────────────┘                       ▲
-           ▼                                    │
-┌───────────────────────┐       ┌───────────────────────────┐
-│  Module E: Analyzer   │──────▶│  Module F: Controller      │
-│  ┌─────────────────┐  │       │  ┌───────────────────────┐ │
-│  │ 规则层:         │  │       │  │Layer 0: Safety Guard  │ │
-│  │ 滑动窗口聚合    │  │       │  │  硬编码规则，最高优先 │ │
-│  │ 数值特征计算    │  │       │  │  不经 LLM             │ │
-│  ├─────────────────┤  │       │  ├───────────────────────┤ │
-│  │ 🤖 LLM 认知层: │  │       │  │Layer 1: LLM Strategy  │ │
-│  │ E-LLM-1 状态    │  │       │  │  🤖 F-LLM-1 策略选择 │ │
-│  │   语义化理解    │  │       │  │  conservative/balanced│ │
-│  │ E-LLM-2 负载    │  │       │  │  /aggressive + 动作   │ │
-│  │   模式识别      │  │       │  ├───────────────────────┤ │
-│  └─────────────────┘  │       │  │Layer 2: Optuna BO     │ │
-└───────────────────────┘       │  │  🤖 F-LLM-2 空间裁剪 │ │
-                                │  │  + TPESampler 精搜    │ │
-                                │  └───────────┬───────────┘ │
-                                └──────────────┼─────────────┘
-                                               ▼
-                                ┌───────────────────────────┐
-                                │  Module G: Executor        │
-                                │  Fast: 更新proxy内存配置   │
-                                │  Slow: 重启vLLM切profile   │
-                                │  Rollback + cooldown       │
-                                │  纯代码，不用 LLM          │
-                                └───────────────────────────┘
+                    ┌──────────────────────────────────────┐
+                    │    workload.json（固定，可复现）      │
+                    └──────────────┬───────────────────────┘
+                                   │
+    ┌──────────────────────────────┴──────────────────────────────┐
+    │                     VTA-Agent Control Loop                   │
+    │                                                              │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  1. Observe  (Tool: observe_trial)                 │    │
+    │   │     Launcher 重启 vLLM with current config         │    │
+    │   │     Runner + Monitor 跑一轮 bench (60–120s)        │    │
+    │   │     → TrialMetrics (throughput/TTFT/TPOT/KV/...)   │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  2. Diagnose  (🤖 A-LLM)                           │    │
+    │   │     input: 最近 N 个 trial 的 metrics + memory      │    │
+    │   │     output: bottleneck + hypothesis + confidence   │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  3. Propose   (🤖 P-LLM + Tools)                   │    │
+    │   │     tools: query_param_docs / list_tried_configs / │    │
+    │   │            compare_trials                          │    │
+    │   │     output: ConfigDelta {param: new_value, reason} │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  4. Safety Check  (硬编码 Judge，不经 LLM)          │    │
+    │   │     · value 在 REGISTRY 候选范围内                  │    │
+    │   │     · 不违反 SLO 守门（预估值）                      │    │
+    │   │     · 不重复最近 3 步已否决的组合                    │    │
+    │   │     unsafe → 反馈给 P-LLM 重试一次                  │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  5. Act       (Tool: apply_config)                 │    │
+    │   │     写临时 config → Launcher.restart()             │    │
+    │   │     失败（OOM / 不就绪）→ 自动 rollback            │    │
+    │   │     成功 → 返回 observe(步骤 1)测新 trial           │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  6. Reflect   (🤖 R-LLM)                           │    │
+    │   │     input: (prev_trial, new_trial, hypothesis)     │    │
+    │   │     output: 验证是否与预期一致 + 新笔记 + next_move │    │
+    │   │     笔记写入 ExperienceMemory                      │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │   ┌────────────────────────────────────────────────────┐    │
+    │   │  7. Terminate?                                     │    │
+    │   │     · 连续 3 步改动 <2% → converged                │    │
+    │   │     · step_budget 用尽                             │    │
+    │   │     · R-LLM 主动 stop=true                         │    │
+    │   │     否则回到步骤 2                                  │    │
+    │   └────────────────────┬───────────────────────────────┘    │
+    │                        ▼                                     │
+    │              best_trial + full memory                        │
+    └──────────────────────────┬──────────────────────────────────┘
+                               ▼
+        ┌──────────────────────────────────────────┐
+        │  Reporter  (🤖 Summary LLM)              │
+        │  memory → final_report.md                │
+        └──────────────────────────────────────────┘
 ```
 
-### 2.2 LLM 参与边界（认知层 vs 控制层）
+### 2.2 核心组件
 
-**核心原则**：LLM 负责"认知层"（理解、判断、规划），程序逻辑负责"控制层"（采集、计算、执行、安全）。
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| **VtaAgent** | `tuner/agent.py` | 主循环，编排 Observe/Diagnose/Propose/Act/Reflect |
+| **ExperienceMemory** | `tuner/memory.py` | 存所有 trial + LLM 笔记；支持 `summarize(top_k, recent_n)` 压缩为 LLM 可读摘要 |
+| **ToolRegistry** | `tuner/tools.py` | LLM 可调用的工具集合（见 §2.4） |
+| **VllmLauncher** | `tuner/launcher.py` | 重启 + 就绪检查 + 计时 + 失败检测 |
+| **Runner** | `tuner/runner.py` | 单次 bench + metrics 聚合 → `TrialMetrics` |
+| **ParamRegistry** | `tuner/param_registry.py` | 参数元数据：候选值、影响维度、先验说明（LLM 通过工具读取） |
+| **Judge** | `tuner/judge.py` | 硬安全阈值：值域检查、SLO 守门、去重 |
+| **LlmClient** | `llm_advisor/llm_client.py` | OpenAI/DeepSeek API 封装 + 限流 + 重试 + 缓存 |
+| **Prompts** | `llm_advisor/prompts.py` | 生成 A/P/R/Reporter prompts |
 
-**LLM 只做三件事**：
+### 2.3 LLM 参与边界
 
-| # | 职责 | 调用点 | 输入 | 输出 |
-|---|------|--------|------|------|
-| 1 | **状态语义化理解** | E-LLM-1/2 | 数值指标表 | 瓶颈类型、趋势、负载模式 |
-| 2 | **高层策略规划** | F-LLM-1 | 语义状态 + 历史 + 动作空间 | conservative/balanced/aggressive + 具体参数 |
-| 3 | **缩小搜索空间** | F-LLM-2 | 当前状态 + 完整搜索空间 | 受限候选集合 |
+**原则**：**LLM 是 orchestrator，不是数值优化器**。每步该问什么、查谁、是否调用 BO 给建议、是否采纳建议、是否回滚——全部由 LLM 推理给出；BO / 敏感度 / Pareto 等算法只在 LLM 主动调用时执行，结果作为参考喂回 LLM。
 
-**LLM 不做四件事**：
+**LLM 做的事**：
 
-| # | 职责 | 负责模块 | 实现方式 |
-|---|------|---------|---------|
-| 1 | 原始指标采集 | Module D (Monitor) | pynvml / /metrics / SSE 时间戳 |
-| 2 | 数值特征计算 | Module E 规则层 | 滑动窗口 / statistics / numpy |
-| 3 | 安全约束与回滚判断 | Module F Layer 0 + Module G | 硬编码 if-else 阈值 |
-| 4 | 底层 API 执行 | Module G (Executor) | aiohttp POST / shell 脚本 |
+| 角色 | 模型调用 | 输入 | 输出 | 频次 |
+|------|---------|------|------|------|
+| **Diagnoser (A-LLM)** | 每步 1 次 | 最近 N 个 trial metrics + memory 摘要 | bottleneck + 假设 + 置信度 | 每步 |
+| **Proposer (P-LLM)** | 每步 1–3 次（可用工具） | 诊断 + 历史 + 参数文档 | ConfigDelta | 每步 |
+| **Reflector (R-LLM)** | 每步 1 次 | 前后 trial 对比 + 原假设 | 笔记 + 下一步建议 + stop 标志 | 每步 |
+| **Reporter** | 结束时 1 次 | 完整 memory + best_trial | 最终报告 markdown 段 | 每 run 1 次 |
 
-### 2.3 LLM Advisor 技术栈
+**LLM 不做的事**（硬编码）：
 
-| 项目 | 选型 |
+| 职责 | 实现 |
 |------|------|
-| API 提供商 | DeepSeek / OpenAI（可配置切换） |
-| 客户端 SDK | `openai` Python 包（兼容 DeepSeek API） |
-| 限流 | `asyncio.Semaphore(1)`，同一时刻最多 1 个 LLM 调用 |
-| 缓存 | TTL dict，相同输入 30s 内复用 |
-| 重试 | 3 次指数退避（1s→2s→4s） |
-| 降级 | LLM 不可用时退化为纯规则引擎，日志标注 `"llm_source": "fallback"` |
-| 输出格式 | JSON（系统 prompt 强制 + `json.loads` 校验） |
+| 原始 metrics 采集 | `monitors/` (pynvml + `/metrics` + SSE 时间戳) |
+| Metrics 聚合为 `TrialMetrics` | `tuner/metrics.py` |
+| 值域校验 / SLO 守门 / 去重 | `tuner/judge.py` |
+| 重启 / 就绪检测 / 回滚 | `tuner/launcher.py` |
+| LLM API 调用的限流/重试/缓存 | `llm_advisor/llm_client.py` |
+| 终止条件判断（收敛 / 预算用尽） | `tuner/agent.py` main loop |
 
-### 2.4 动作空间定义
+### 2.4 Agent 工具集（LLM 可调用）
 
-**快动作（Proxy 层，毫秒级生效）**
+P-LLM 采用 OpenAI function-calling 风格，可在单次推理中多次调用工具再输出最终 ConfigDelta。工具分两类：**A. 只读查询**（轻量、永远可用）；**B. 优化算法**（重计算，由 LLM 按需触发，结果作为建议参考）。
 
-| 参数 | 候选值 | 默认 |
-|------|--------|------|
-| `batching_window_ms` | {0, 10, 20, 50} | 0 |
-| `max_concurrency` | {4, 8, 16, 32} | 32 |
-| `admission_threshold` | {0.7, 0.8, 0.9, 1.0} | 1.0 |
+#### A. 只读查询工具
 
-**慢动作（vLLM 重启，~45s 生效）**
+| 工具名 | 参数 | 返回 | 用途 |
+|--------|------|------|------|
+| `list_params()` | — | `[{name, mutation_class, candidates, affects, notes}, ...]` | 枚举全部可调参数 |
+| `query_param_docs(name)` | `name: str` | `ParamSpec` 详情 + 该参数在 memory 中被试过的所有值及结果 | 深挖某个参数 |
+| `list_tried_configs(top_k=5)` | `top_k: int` | 历史 trial 按 score 排序的前 k 条 | 查"以前什么好" |
+| `compare_trials(a_id, b_id)` | ids | 两 trial 的 metrics diff + params diff | 做 A/B 对比 |
+| `get_baseline()` | — | `TrialMetrics` | 对照基线 |
+| `get_memory_notes()` | — | R-LLM 累积的自然语言笔记 | 查"agent 自己总结过什么" |
 
-| Profile | max_num_seqs | max_model_len | enable_prefix_caching | 场景 |
-|---------|-------------|--------------|----------------------|------|
-| **L** (低延迟) | 16 | 1024 | false | 短请求快响应 |
-| **B** (平衡) | 32 | 2048 | false | 通用场景（当前 baseline） |
-| **T** (高吞吐) | 48 | 2048 | true | 大量请求+前缀共享 |
+#### B. 优化算法工具（LLM 驱动的算法）
 
-### 2.5 SLO 与 Reward
+这些工具把成熟的数值/优化算法封装成函数调用——LLM 决定**何时调用、传哪些参数、是否采纳结果**，算法负责数值密集的子任务。
 
-- **SLO**: TTFT_p95 < 200ms，latency_p95 < 5000ms
-- **Reward**: R = 0.4 × throughput_norm − 0.4 × slo_violation_rate − 0.2 × reject_rate
-- **Optuna**: TPESampler, ask-and-tell，每个 trial = 1 个控制窗口（60s）
+| 工具名 | 参数 | 返回 | 何时该调用 |
+|--------|------|------|-----------|
+| `bo_suggest(scope, n=1, objective="score", min_history=4)` | `scope`: 待搜索参数子集；`objective`: 单目标或加权多目标 | `[{config, expected_score, acquisition, uncertainty}, ...]` | memory ≥ 4 条且 LLM **不确定**该往哪走时，让 TPE 给候选；LLM 再审阅是否符合直觉与笔记 |
+| `param_sensitivity()` | — | `[{param, score_variance, spearman, monotonic, best_value}, ...]` 按敏感度降序 | 想知道"哪些参数最值得继续动" / 收敛时定位还能挖什么 |
+| `pareto_front(metrics=["throughput","latency_p95"])` | 二/三目标 | 非支配 trial 列表 + 支配关系 | 当 SLO 紧、需要 trade-off 时帮 LLM 看清楚边界 |
+| `local_grid(param, neighborhood=2)` | 参数名 + 邻域宽度 | 候选值列表（已剔除试过的） | 微调阶段，LLM 想"在 best 附近扫一圈" |
+| `cluster_workload_phases(window_s=30)` | — | metrics 时序的 phase 切分 + 每 phase 指纹 | workload 有 phase-switch 时给 LLM 看清楚分段 |
+
+**算法实现**（程序侧，文件 `tuner/optimizer.py`）：
+
+- `bo_suggest` → `optuna.create_study(sampler=TPESampler(n_startup_trials=2))`，把 memory 中所有 trial enqueue 后 `study.ask()` 出 n 个候选；返回 `acquisition` 用 EI 近似 / `uncertainty` 用 TPE l(x)/g(x) 比值
+- `param_sensitivity` → score 关于 param 的方差 + Spearman 相关 + 单调性检验（n≥4 才有效，否则返回 `insufficient_data=True`）
+- `pareto_front` → 朴素 O(n²) 扫描非支配集
+- `local_grid` → 从 `REGISTRY[param].candidates` 中按距离选邻域 ∖ 已试过
+- `cluster_workload_phases` → metrics_timeseries 的 1D KMeans / change-point（基于 throughput 序列）
+
+**关键设计**：算法工具的输出**永远是建议**，不是命令。P-LLM 必须在 ConfigDelta 的 `reason` 字段里给出"采纳/修改/拒绝该建议"的理由（例如："BO 推荐 max_num_seqs=128 但 memory 笔记显示>64 触发 preempt，采纳但下调到 96"）。
+
+#### 禁止工具（防止 LLM 作弊 / 越权）
+
+- LLM **不能**直接调用 `apply_config`——必须由 P-LLM 输出结构化 ConfigDelta，Judge 审核后由程序调用
+- LLM **不能**调用 shell / 文件系统 / 网络
+- 所有工具均为**纯函数 / 只读**，无副作用（除写一条调用日志到 `llm_calls.jsonl`）
+
+### 2.5 Memory 结构
+
+```python
+@dataclass
+class TrialRecord:
+    trial_id: int
+    config: dict              # vLLM engine args 快照
+    delta_from_prev: dict     # 相对上一 trial 的改动
+    hypothesis: str           # P-LLM 提出该配置时的假设
+    metrics: TrialMetrics
+    score: float
+    constraint_violations: list[str]  # SLO 违反项
+    reflection: str           # R-LLM 写的"是否符合预期 / 学到什么"
+    timestamp: str
+
+@dataclass
+class ExperienceMemory:
+    baseline: TrialMetrics
+    trials: list[TrialRecord]
+    notes: list[str]          # R-LLM 累积的跨 trial 笔记（如"max_num_seqs>64 会触发 preempt"）
+    rejected_proposals: list[tuple[dict, str]]  # (config, reject_reason)
+
+    def summarize(self, top_k=3, recent_n=5) -> str:
+        """返回给 A/P/R-LLM 的压缩摘要：
+        - baseline 关键数字
+        - Top-k 最佳 trial 的 config + 关键 metrics
+        - 最近 n 步的 delta + reflection
+        - 累积 notes
+        """
+```
+
+Memory 是 agent 的"学习成果"；LLM 的每次调用都看到它的摘要，而不是 raw trial 数组，以控 token。
+
+### 2.6 参数分层与动作空间
+
+**RESTART 类（绝大多数调优旋钮，每次改动需重启 vLLM）**
+
+| 参数 | 候选 | 影响维度 | 先验（供 P-LLM 参考） |
+|------|------|---------|----------------------|
+| `max_num_batched_tokens` | 2048 / 4096 / 8192 / 16384 | throughput, TTFT, TPOT | 大→吞吐好 TTFT 好，小→TPOT 好 |
+| `max_num_seqs` | 16 / 32 / 64 / 128 | throughput, KV 压力 | 大→吞吐上限高，但易 preempt |
+| `gpu_memory_utilization` | 0.85 / 0.90 / 0.93 / 0.95 | KV 容量 | 高→KV 多，但 activation 余量小 |
+| `max_model_len` | 2048 / 4096 / 8192 | KV block 分配 | 按实际 p95 剪裁，省 KV |
+| `enable_prefix_caching` | False / True | prefill 节省 | prefix 共享高时开 |
+| `enable_chunked_prefill` | False / True | TTFT/TPOT 平衡 | 长短混合时开 |
+| `max_num_partial_prefills` | 1 / 2 / 4 | chunked prefill 并发 | 长短混合时调高 |
+| `max_long_partial_prefills` | 1 / 2 | 长 prompt 并发上限 | 同上 |
+| `long_prefill_token_threshold` | 1024 / 2048 / 4096 | 长短 prompt 分界 | 由 profiler 推出 |
+
+**RUNTIME 类**：仅 `reset_prefix_cache`（cold/warm 对照用，不是调优旋钮）。
+
+**PER_REQUEST 类**：sampling params、`priority`。本方案不作为调优目标。
+
+**结论**：本 agent **每改一个参数就必须重启 vLLM**，没有"便宜动作"。因此 agent loop 每步 ~3 min（重启 60s + bench 90s + LLM 决策 5–10s），这个 **step 成本就是约束 LLM 必须高效推理**的客观理由。
+
+### 2.7 优化目标与约束
+
+- **SLO 硬约束（违反则 score = −∞，该 trial 仍被记入 memory 用于学习）**：
+  - `TTFT_p95 ≤ baseline.TTFT_p95 × 1.2`
+  - `latency_p95 ≤ baseline.latency_p95 × 1.2`
+  - `preemption_rate_per_min ≤ 5`
+- **主目标**：
+  ```
+  score = (throughput_tok_per_s − baseline.throughput_tok_per_s)
+        /  baseline.throughput_tok_per_s
+  ```
+- **验收门槛**：至少 2/3 的 workload 类型达到 ≥ 10% 提升，3/3 不违反 SLO。
+
+### 2.8 预算估算（Qwen3-8B on A6000）
+
+**单步成本**（一次 Observe+Diagnose+Propose+Act+Reflect）
+
+| 阶段 | 时间 |
+|------|------|
+| Launcher.restart (CUDA graph) | ~50 s |
+| Warmup + Bench | ~90 s |
+| A-LLM + P-LLM + R-LLM 三次调用 | ~5 s |
+| 算法工具（BO / 敏感度 / Pareto，按需触发，纯本地计算） | <1 s |
+| Judge + memory 更新 | <1 s |
+| **合计** | **~145 s ≈ 2.5 min** |
+
+**单 workload 预算**：最多 20 步 × 2.5 min ≈ **50 min**（远快于无约束网格搜索）
+
+**减时间策略**：
+
+1. **早期步骤用 `enforce_eager`**（步骤 1–5）：每步 −25 s，A-LLM 拿到的信号足够粗判；最优候选 ≥3 次出现在 Top-3 后自动切回 graph 模式。
+2. **保留 OS 页缓存**（不 `drop_caches`）：第 2 次起 restart −15 s。
+3. **在线早停**：bench 窗口内 `preempt_rate > 2/s` 或 `throughput < baseline × 0.5` → 20 s 内终止，返回"崩盘 trial"给 LLM 学习。
+4. **LLM 短路**：A-LLM 判定"已收敛 + SLO 充裕"时直接输出 stop，跳过 P-LLM。
+
+**3 种 workload 总预算**：~3 h（含消融 ~5 h）。
+
+**LLM API 成本**：每步 ~2000 tokens，20 步 × 3 次 = ~120k tokens/run，DeepSeek 单价 ¥1-2/M → ~¥0.3/run。全实验 < ¥5。
 
 ---
 
@@ -247,267 +393,279 @@ d:/vlllm/
 
 ### 3.1 调用全景图
 
-```
-每个决策周期 (30s):
+VTA-Agent 每一步调用 **3 个 LLM 角色**，加上结束时 1 次 Reporter。所有调用通过同一个 `LlmClient`，走 OpenAI 兼容接口。
 
-  ┌──────────────────────────────────────────┐
-  │  API 调用 #1（Analyzer → LLM）           │
-  │                                          │
-  │  合并 E-LLM-1 + E-LLM-2                 │
-  │  状态语义化 + 负载模式识别                │
-  │  输入 ~600 tokens，输出 ~300 tokens       │
-  │  延迟 ~1-2s                              │
-  └──────────────────┬───────────────────────┘
-                     │ AnalyzerState
+```
+每个 agent step (~2.5 min, 重启+bench+LLM):
+
+  ┌────────────────────────────────────────────┐
+  │  A-LLM (Diagnoser)   ~1 s                  │
+  │  input : memory.summarize() + 最新 trial    │
+  │  output: diagnosis JSON                    │
+  └──────────────────┬─────────────────────────┘
                      ▼
-  ┌──────────────────────────────────────────┐
-  │  API 调用 #2（Controller → LLM）          │
-  │                                          │
-  │  F-LLM-1 策略选择 + 动作决策              │
-  │  输入 ~800 tokens，输出 ~300 tokens       │
-  │  延迟 ~1.5-2s                            │
-  └──────────────────┬───────────────────────┘
-                     │ ControllerDecision
+  ┌────────────────────────────────────────────┐
+  │  P-LLM (Proposer)    ~2-4 s                │
+  │  input : diagnosis + memory                │
+  │  tools : list_params / query_param_docs /  │
+  │          list_tried_configs / compare_trials│
+  │  output: ConfigDelta JSON                  │
+  └──────────────────┬─────────────────────────┘
                      ▼
-            Safety Guard 校验 → Executor 执行
+           Judge 审核（硬编码）
+                     ▼
+              apply_config → observe
+                     ▼
+  ┌────────────────────────────────────────────┐
+  │  R-LLM (Reflector)   ~1-2 s                │
+  │  input : (prev_trial, new_trial, hypothesis)│
+  │  output: reflection JSON + note            │
+  └──────────────────┬─────────────────────────┘
+                     ▼
+         (loop or terminate)
 
-每个 Optuna trial (60s，仅 Layer 2 启用时):
+tuning run 结束后:
 
-  ┌──────────────────────────────────────────┐
-  │  API 调用 #3（Controller → LLM）          │
-  │                                          │
-  │  F-LLM-2 搜索空间裁剪                    │
-  │  输入 ~600 tokens，输出 ~200 tokens       │
-  │  延迟 ~1s                                │
-  └──────────────────────────────────────────┘
+  ┌────────────────────────────────────────────┐
+  │  Reporter LLM        ~3 s                  │
+  │  input : 完整 memory + best_trial          │
+  │  output: markdown 段落（写入 report.md）   │
+  └────────────────────────────────────────────┘
 ```
 
-### 3.2 E-LLM-1+2：状态语义化 + 负载模式识别（合并为 1 次调用）
+**失败降级**：
+- A/P/R 任何一次 LLM 失败 → 走 fallback 规则（硬编码最小决策：P-LLM fallback 用"轮询下一个未试过的参数中位值"）；该 step 的 trial 仍然执行并记入 memory，标记 `llm_source=fallback`。
+- Reporter 失败 → report 只输出结构化数据表，不生成自然语言段。
+
+### 3.2 A-LLM：Diagnoser（每步诊断瓶颈）
 
 **System Prompt**:
 
 ```
-你是 vLLM 推理服务的性能分析专家。你的任务是根据系统指标判断当前的运行状态。
+你是 vLLM 推理服务的性能诊断专家。你在一个闭环调参 agent 内部工作，每一步都会收到最新 trial 的
+运行时指标、历史最佳 trial 与 agent 自己积累的笔记。你的任务是定位当前的首要瓶颈并提出一个
+明确的、可验证的假设（下一步如果朝某方向调参会得到什么样的指标变化）。
 
-你会收到一张包含三个时间窗口（10s/30s/60s）的指标表和实时快照。
-你必须输出一个 JSON 对象，包含状态语义化描述和负载模式分类。
+瓶颈枚举: prefill_bound | decode_bound | kv_cache_pressure | preempt_storm |
+          queue_backlog | underutilized | slo_margin_low | converged
 
-可用的瓶颈类型: prefill | decode | memory | queue | none
-可用的负载模式: short_burst | long_prompt | long_decode | prefix_heavy | mixed
-可用的趋势: degrading | stable | improving
-可用的风险等级: safe | warning | critical
-可用的到达特征: bursty | steady | ramping
-
-你必须且只能以 JSON 格式回复，不要添加任何其他文字。
+硬性规则:
+- 基于实际数字推理，不要编造；如果数据不足以判断某瓶颈，confidence 给低分。
+- 如果最近 3 步 score 改动 <2% 且 SLO 无余量，应输出 converged。
+- 只输出 JSON，不要 markdown 围栏以外的任何解释。
 ```
 
 **User Prompt 模板**:
 
 ```
-## 系统指标快照
+## Baseline（对照组）
+{baseline_metrics_json}
 
-### 实时值
-- GPU 利用率: {gpu_util_pct}%
-- 显存占用: {mem_used_mib}/{mem_total_mib} MiB ({mem_util_pct}%)
-- KV Cache 使用率: {kv_cache_pct}%
-- 队列深度: {queue_depth}
-- 活跃请求数: {in_flight}
-- 拒绝率（最近30s）: {reject_rate}%
+## Memory 摘要（Top-3 最佳 + 最近 5 步）
+{memory_summary}
 
-### 滑动窗口聚合（10s / 30s / 60s）
-| 指标 | 10s | 30s | 60s |
-|------|-----|-----|-----|
-| TTFT mean (ms) | {ttft_10s_mean} | {ttft_30s_mean} | {ttft_60s_mean} |
-| TTFT P95 (ms) | {ttft_10s_p95} | {ttft_30s_p95} | {ttft_60s_p95} |
-| TPOT mean (ms) | {tpot_10s_mean} | {tpot_30s_mean} | {tpot_60s_mean} |
-| latency P95 (ms) | {lat_10s_p95} | {lat_30s_p95} | {lat_60s_p95} |
-| throughput (req/s) | {tput_10s} | {tput_30s} | {tput_60s} |
+## 最新 Trial
+- trial_id: {tid}
+- config: {config_delta_from_baseline}
+- metrics:
+  throughput_tok_per_s={tput}  (vs baseline {base_tput}, {pct:+.1%})
+  TTFT_p95_ms={ttft}, latency_p95_ms={lat}, TPOT_p95_ms={tpot}
+  preempt_rate_per_min={preempt}, kv_cache_usage_p95={kv}
+  queue_time_p95_ms={qt}, early_killed={ek}
+- SLO 余量:
+  TTFT headroom = {ttft_headroom:.1%}   # (limit - current) / limit
+  latency headroom = {lat_headroom:.1%}
 
-### 请求统计（最近 30s）
-- 平均 prompt 长度: {avg_prompt_len} tokens
-- 平均 output 长度: {avg_output_len} tokens
-- prefix group 占比: {prefix_ratio}%
-- 到达率: {arrival_rate} req/s
-- 到达 CV（变异系数）: {arrival_cv}
-
-### 当前配置
-- Proxy: batching_window={bw}ms, max_concurrency={mc}, admission_threshold={at}
-- Backend Profile: {profile} (max_num_seqs={mns}, max_model_len={mml})
-
-请分析上述指标并输出 JSON。
+请输出 diagnosis JSON。
 ```
 
 **输出 JSON Schema**:
 
 ```json
 {
-  "state_description": "string — 2-3句中文描述系统当前状态",
-  "bottleneck_type": "prefill | decode | memory | queue | none",
-  "bottleneck_confidence": 0.85,
-  "trend": "degrading | stable | improving",
-  "risk_level": "safe | warning | critical",
-  "risk_signals": ["kv_cache_near_full", "tpot_rising"],
-  "dominant_pattern": "short_burst | long_prompt | long_decode | prefix_heavy | mixed",
-  "pattern_confidence": 0.78,
-  "secondary_pattern": "string | null",
-  "arrival_characteristic": "bursty | steady | ramping",
-  "reasoning": "string — 分析推理过程"
+  "bottleneck": "decode_bound",
+  "confidence": 0.78,
+  "evidence": "TPOT_p95 从 baseline 45ms 升到 58ms；GPU util 95%；preempt_rate=0",
+  "hypothesis": "max_num_seqs=32 时 decode 并发不足，尝试 64 预期 throughput +15%，TPOT 基本不变",
+  "slo_pressure": "low | medium | high",
+  "should_stop": false
 }
 ```
 
-**Few-shot 示例**（至少 3 个，应在 Week 4 用真实实验数据填充）:
-
-```
-示例 1: GPU 高利用率 + TPOT 上升 → bottleneck=decode, pattern=long_decode
-示例 2: 队列深度快速增长 + TTFT 飙升 → bottleneck=queue, pattern=short_burst
-示例 3: KV cache 87% + 显存接近满 → bottleneck=memory, risk=warning
-```
-
-### 3.3 F-LLM-1：策略选择 + 动作决策
+### 3.3 P-LLM：Proposer（每步提出参数改动，可调用工具）
 
 **System Prompt**:
 
 ```
-你是 vLLM 推理服务的自主优化控制器。你的目标是在满足 SLO 约束的前提下最大化吞吐量。
+你是 vLLM 推理服务的参数调优决策者。你接到一份诊断（bottleneck + hypothesis）后，
+必须选择唯一的一次参数改动并输出结构化 ConfigDelta。你可以通过调用工具完成两类工作：
+查询历史/参数文档；触发数值优化算法获得候选建议。最终必须输出一条 ConfigDelta。
 
-SLO 约束:
-- TTFT P95 < 200ms
-- 端到端延迟 P95 < 5000ms
+工具列表（A. 只读）:
+- list_params() -> [ParamSpec]
+- query_param_docs(name) -> ParamSpec + 该参数在 memory 中被试过的值及结果
+- list_tried_configs(top_k=5) -> Top-k 最佳历史 trial
+- compare_trials(a_id, b_id) -> metrics diff + params diff
+- get_memory_notes() -> R-LLM 累积笔记
 
-你会收到系统的语义状态分析和可用动作空间。
-你必须选择一个策略模式，并给出具体的参数调整动作。
+工具列表（B. 优化算法，按需调用）:
+- bo_suggest(scope, n=1, objective="score") -> Optuna TPE 在 memory 上拟合后的 n 个候选 config + 不确定度
+- param_sensitivity() -> 各参数 score 方差 / Spearman 相关 / 单调性，按敏感度降序
+- pareto_front(metrics=["throughput","latency_p95"]) -> 非支配 trial 列表
+- local_grid(param, neighborhood=2) -> best 附近未试过的候选值
+- cluster_workload_phases() -> metrics 时序的 phase 切分（仅 mixed workload 有意义）
 
-策略模式:
-- conservative: 优先保证 SLO，降低并发，收紧准入
-- balanced: 在 SLO 安全范围内适度提升吞吐
-- aggressive: SLO 余量充足时激进提升吞吐
+调用建议（agent 工作流）:
+- memory < 4 条 -> 依赖 diagnosis + query_param_docs 直接决策（BO 数据不足）
+- memory ≥ 4 条且 diagnosis.confidence < 0.6 -> 调用 bo_suggest 获取候选，再用领域知识审阅
+- 连续 2 步 score 改动 <3% -> 调用 param_sensitivity 找下一个值得动的参数
+- SLO headroom < 10% -> 调用 pareto_front 看清楚 trade-off 边界
+- 接近收敛 -> 调用 local_grid 在 best 邻域微调
 
-动作类型:
-- fast_only: 仅调整 Proxy 层快参数
-- slow_only: 仅切换 Backend Profile（需要重启 vLLM，~45s 服务中断）
-- both: 同时调整快参数和切换 Profile
-- none: 维持当前配置不变
+硬性规则:
+- 同一步只改 1 个参数（除非 diagnosis.should_stop=true）。
+- 新值必须来自 ParamSpec.candidates（不接受自由数值）。
+- 不能重复 memory.rejected_proposals 中最近 3 条。
+- 每一个 ConfigDelta 必须附带 expected_effect。
+- 若调用了优化算法工具，reason 字段必须明确写"采纳 / 修改 / 拒绝该建议"及理由。
+- 若 diagnosis.should_stop=true，输出 {"action": "stop", "reason": "..."}。
 
-重要安全约束（你必须遵守）:
-- 如果 risk_level=critical，只能选 conservative
-- 如果最近一次 Profile 切换不到 60s，不能再次切换
-- 如果最近一次快参数调整不到 20s，不能同方向再次调整
-- 不要在 bottleneck=memory 时增大 max_concurrency
-
-你必须且只能以 JSON 格式回复。
+只输出 JSON。
 ```
 
 **User Prompt 模板**:
 
 ```
-## 当前状态（来自 Analyzer）
-{analyzer_state_json}
+## Diagnosis（来自 A-LLM）
+{diagnosis_json}
 
-## 当前配置
-- Proxy: batching_window={bw}ms, max_concurrency={mc}, admission_threshold={at}
-- Backend Profile: {profile}
+## 当前 config（完整）
+{current_config_json}
 
-## 可用动作空间
-### 快动作（Proxy 层）
-- batching_window_ms: 可选 {0, 10, 20, 50}，当前 {bw}
-- max_concurrency: 可选 {4, 8, 16, 32}，当前 {mc}
-- admission_threshold: 可选 {0.7, 0.8, 0.9, 1.0}，当前 {at}
+## Memory 摘要
+{memory_summary}
 
-### 慢动作（Profile 切换，需 ~45s 重启）
-- 可选 Profile: L(低延迟), B(平衡), T(高吞吐)，当前 {profile}
+## 累积笔记（来自 R-LLM）
+{notes_list}
 
-## 最近 5 次决策历史
-{recent_decisions_json}
-
-请选择策略模式和具体动作。
+请按需调用工具（至少 1 次 query_param_docs 验证候选合法性；视情况调用 bo_suggest /
+param_sensitivity / pareto_front / local_grid），然后输出 ConfigDelta。
 ```
 
 **输出 JSON Schema**:
 
 ```json
 {
-  "policy_mode": "conservative | balanced | aggressive",
-  "action_type": "fast_only | slow_only | both | none",
-  "fast_action": {
-    "batching_window_ms": 20,
-    "max_concurrency": 16,
-    "admission_threshold": 0.9
+  "action": "change_param | stop",
+  "param": "max_num_seqs",
+  "old_value": 32,
+  "new_value": 64,
+  "hypothesis_ref": "验证 A-LLM 的 decode_bound 假设",
+  "tools_used": ["query_param_docs", "bo_suggest"],
+  "reason": "BO 推荐 max_num_seqs=128（acquisition=0.42），但 memory 笔记显示该 workload >64 触发 preempt；采纳 BO 方向但下调到 64 作为渐进步骤",
+  "expected_effect": {
+    "throughput_tok_per_s": "+10% ~ +20%",
+    "TTFT_p95_ms": "不变或 +5%",
+    "TPOT_p95_ms": "不变",
+    "risk": "preempt_rate 可能升高"
   },
-  "slow_action": {
-    "target_profile": "T | B | L | null"
-  },
-  "reasoning": "string — 决策理由",
-  "confidence": 0.82,
-  "expected_effect": "string — 预期效果"
+  "rollback_if": "throughput 提升 <3% 或 preempt_rate > 3"
 }
 ```
 
-### 3.4 F-LLM-2：Optuna 搜索空间裁剪
+### 3.4 R-LLM：Reflector（每步复盘 + 写长期笔记）
 
 **System Prompt**:
 
 ```
-你是 vLLM 推理服务的参数优化顾问。你的任务是根据当前系统状态，
-缩小 Optuna 贝叶斯优化器的搜索空间，去掉明显不合理的参数组合。
+你是 vLLM 调参 agent 的"学习主脑"。每一步 agent 执行完 ConfigDelta 并测到新 trial 后，
+你会收到改动前后的 trial 对比、原假设、以及该 trial 是否违反 SLO。你的任务:
+1. 判断实际结果是否符合 P-LLM 的 expected_effect（accept / partial / reject）。
+2. 产出一条可复用的长期笔记（自然语言，一句话），写入 memory.notes。
+3. 建议下一步方向（explore 其他参数 / double-down 当前方向 / rollback）。
 
-你会收到当前状态和完整搜索空间，以及最近几次 trial 的结果。
-你需要输出一个受限的候选空间，以及可以直接固定的参数。
-
-你必须且只能以 JSON 格式回复。
+硬性规则:
+- 笔记必须是参数级的通用规律，不是具体数字（好:"max_num_seqs 超过 64 时此 workload 触发 preempt"；
+  坏:"trial_7 的吞吐是 203 tok/s"）。
+- 如果最近 3 步 accept 率 <30%，建议 explore 新参数；如果 >70% 且 SLO 余量低，建议 stop。
+- 只输出 JSON。
 ```
 
 **User Prompt 模板**:
 
 ```
-## 当前状态
-{analyzer_state_json}
+## P-LLM 的原假设
+{proposal_json}
 
-## 完整搜索空间
-- batching_window_ms: {0, 10, 20, 50}
-- max_concurrency: {4, 8, 16, 32}
-- admission_threshold: {0.7, 0.8, 0.9, 1.0}
-- backend_profile: {L, B, T}
+## 改动前 trial
+{prev_trial_json}
 
-## 最近 trial 历史
-{recent_trials_json}
+## 改动后 trial
+{new_trial_json}
 
-请给出受限候选空间和可固定参数。
+## 约束检查结果（硬编码 Judge 给出）
+{constraint_check_json}
+
+## 当前 memory notes
+{notes_list}
+
+请输出 reflection JSON。
 ```
 
 **输出 JSON Schema**:
 
 ```json
 {
-  "constrained_space": {
-    "batching_window_ms": [0, 10],
-    "max_concurrency": [8, 16, 32],
-    "admission_threshold": [0.9, 1.0],
-    "backend_profile": ["B", "T"]
-  },
-  "fixed_params": {
-    "admission_threshold": 0.9
-  },
-  "reasoning": "string — 裁剪理由"
+  "verdict": "accept | partial | reject",
+  "reason": "throughput +14% 符合 expected_effect，preempt_rate 仍为 0",
+  "new_note": "max_num_seqs 32→64 在 decode_heavy workload 上带来 +14% 吞吐且无 preempt",
+  "next_move_hint": "double_down | explore_other | rollback | stop",
+  "hint_detail": "继续试 max_num_seqs=128 以摸 preempt 上限"
 }
 ```
 
-### 3.5 API 成本估算（DeepSeek-Chat）
+### 3.5 Reporter（结束时 1 次）
+
+**System Prompt**:
+
+```
+你是 vLLM 调参 agent 的报告撰写者。你会收到完整的 memory（所有 trial + 所有笔记）和 best_trial，
+需要写一段中文自然语言报告（3–5 段），直接嵌入 final_report.md。要求:
+1. 总结最优配置相对 baseline 的改动和效果；
+2. 讲搜索过程中的关键转折（哪些 trial 让 agent 改变了方向）；
+3. 指出 agent 未能覆盖的部分（未试过的参数组合、可能的更优方向）。
+
+基于数据推理，不要编造数字。纯文本段落，不要 JSON。
+```
+
+**User Prompt**：`{baseline}` + `{full_memory}` + `{best_trial}`。
+
+**输出**：纯 markdown 段落，直接粘贴到 `docs/final_report.md`。
+
+### 3.6 API 成本估算（DeepSeek-Chat）
 
 | 指标 | 值 |
 |------|-----|
-| 每决策周期 tokens | ~2000（两次调用合计） |
-| 决策周期 | 30s |
-| 10 分钟实验 | ~40,000 tokens |
-| DeepSeek 单价 | ¥1/百万 input, ¥2/百万 output |
-| **单次 10 分钟实验成本** | **~¥0.05** |
-| 一天 20 次实验 | ~¥1 |
+| 单步 tokens（A+P+R，含工具往返） | ~2000 |
+| 单 run step 数（含收敛提前停） | 15–20 |
+| 单 run 总 tokens | ~40k |
+| Reporter | ~3k |
+| **单 run 成本** | **~¥0.1** |
+| 3 种 workload + 5 种消融 | ~¥1 |
+
+### 3.7 安全与作弊防护
+
+- **P-LLM 不能直接写 vLLM config**：它的输出必须是结构化 ConfigDelta，Judge 校验值域后才由程序执行。
+- **工具不可伪造**：`query_param_docs` 返回的是内存中的 `ParamSpec` 对象序列化，不是 LLM 自己生成。
+- **去重**：Judge 检查 `(param, value)` 是否与最近 3 步 rejected_proposals 冲突，冲突则反馈给 P-LLM 要求重试（最多重试 1 次）。
+- **无限循环防护**：agent 主循环最多 `max_steps=25` 硬上限，超出立即 stop。
 
 ---
 
 ## 四、执行总览
 
 ```
-Week 3: Module A — Workload Generator
+Week 3: Module A — Workload Generator（已完成 ✅）
   ├── Task 3.1: workload 配置 schema + 预设
   ├── Task 3.2: prompt 语料池 30+
   ├── Task 3.3: 共享前缀池 5+
@@ -515,7 +673,7 @@ Week 3: Module A — Workload Generator
   ├── Task 3.5: phase-switch 能力
   └── Task 3.6: 集成 run_benchmark.py
 
-Week 4: Module D — Monitor + Data Pipeline
+Week 4: Module D — Monitor + Data Pipeline（已完成 ✅）
   ├── Task 4.1: TPOT 逐 token 时间戳
   ├── Task 4.2: GPU 实时采样器
   ├── Task 4.3: vLLM /metrics 采集器
@@ -523,38 +681,35 @@ Week 4: Module D — Monitor + Data Pipeline
   ├── Task 4.5: 实验套件配置集
   └── Task 4.6: 运行初始实验集
 
-Week 5: Module B — Proxy / Gateway
-  ├── Task 5.1: 最小 proxy 骨架
-  ├── Task 5.2: batching window
-  ├── Task 5.3: max concurrency
-  ├── Task 5.4: admission threshold + 429
-  ├── Task 5.5: /proxy/metrics 端点
-  └── Task 5.6: /internal/config/proxy 热更新
+Week 5: 平台迁移 — A6000 + Qwen3-8B
+  ├── Task 5.1: A6000 环境与依赖安装
+  ├── Task 5.2: Qwen3-8B 模型获取与量化选型（默认 bf16）
+  ├── Task 5.3: configs / profiles / start_server.sh 适配
+  ├── Task 5.4: tests 与 monitor 适配（76 tests 继续全绿）
+  └── Task 5.5: A6000 + Qwen3-8B 新 Baseline
 
-Week 6: LLM Advisor + Module E + Module C
-  ├── Task 6.1: LlmAdvisor 基础设施
-  ├── Task 6.2: 4 套 Prompt 模板
-  ├── Task 6.3: Analyzer 规则核心
-  ├── Task 6.4: Analyzer LLM 集成
-  ├── Task 6.5: 3 个 backend profile 配置
-  ├── Task 6.6: ProfileManager 类
-  └── Task 6.7: Analyzer 集成测试
+Week 6: VTA-Agent 基础设施（agent 框架 + 外围工具）
+  ├── Task 6.1: VllmLauncher（热重启 + ready 探测 + 页缓存保留 + eager 透传）
+  ├── Task 6.2: 扩展 metrics 采集 + 产物字段补齐（queue_time + summary 聚合 vllm 指标）
+  ├── Task 6.3: TrialMetrics + Runner（单 trial 闭环 + 在线早停）
+  ├── Task 6.4: ExperienceMemory + TrialRecord + summarize()
+  ├── Task 6.5: ParamRegistry（RESTART/RUNTIME 分层 + candidates）
+  ├── Task 6.6: ToolRegistry — A 只读工具（6 个 read-only）
+  ├── Task 6.7: Optimizer — B 算法工具（bo_suggest / param_sensitivity / pareto_front / local_grid / cluster_workload_phases）
+  └── Task 6.8: LlmClient（OpenAI 兼容 + function-calling + 重试/缓存/限速）
 
-Week 7: Module G + Module F — Executor + Controller + 闭环
-  ├── Task 7.1: Executor 快路径
-  ├── Task 7.2: Executor 慢路径
-  ├── Task 7.3: Rollback + 安全机制
-  ├── Task 7.4: BaseController + FixedController
-  ├── Task 7.5: Safety Guard (Layer 0)
-  ├── Task 7.6: LLM Strategy Controller (Layer 1)
-  └── Task 7.7: 闭环集成 + 稳定性测试
+Week 7: VTA-Agent 闭环决策主脑
+  ├── Task 7.1: A-LLM Diagnoser（prompt + 解析 + 单测）
+  ├── Task 7.2: P-LLM Proposer（prompt + tool-calling + ConfigDelta 解析）
+  ├── Task 7.3: R-LLM Reflector（prompt + note append + next_move hint）
+  ├── Task 7.4: Judge（值域 / SLO 门 / rejected 去重 / 循环防护）
+  └── Task 7.5: VtaAgent 主循环（Observe→Diagnose→Propose→Act→Reflect + 终止条件 + 失败回退）
 
-Week 8: Optuna + 对比实验
-  ├── Task 8.1: Optuna 依赖 + 离散空间
-  ├── Task 8.2: LLM 搜索空间裁剪 (F-LLM-2)
-  ├── Task 8.3: OptunaController
-  ├── Task 8.4: 4 组对比实验
-  └── Task 8.5: 消融实验 + 结果汇总
+Week 8: 对比实验与最终报告
+  ├── Task 8.1: Reporter LLM + final_report.md 生成器
+  ├── Task 8.2: run_tuning.sh 端到端 + 3 种 workload（prefill / decode / mixed）
+  ├── Task 8.3: 5 组消融（random-proposer / no-memory / no-reflect / fixed-config / no-early-stop）
+  └── Task 8.4: 3 张核心图 + final_report.md 定稿
 ```
 
 ---
@@ -1119,1516 +1274,721 @@ results/<experiment_id>/
 
 ---
 
-## 七、Week 5 — Module B: Proxy / Gateway
+## 七、Week 5 — 平台迁移：A6000 + Qwen3-8B
 
-### Task 5.1: 实现最小 proxy 骨架
+> **本周目标**：把现有项目从 RTX 4060 Laptop (8 GB) 迁到 A6000 (48 GB)，模型从 Qwen2.5-3B-Instruct-AWQ 换为 Qwen3-8B，重建 baseline 并验证所有既有模块（workloads / monitors / benchmarks / tests）在新平台上可用。
+>
+> **重要前提**：此前基于 "proxy 在线控制" 的设计（旧 Week 5–8）全部作废。新的 Week 6–8 采用 **VTA-Agent**（离线重启调参 agent）方案，见 §八–§十。
 
-**目标**：新建轻量级反向代理，接收 OpenAI-compatible 请求并转发给 vLLM。
+### Task 5.1: A6000 环境与依赖安装
 
-**操作**：
-1. 新建 `proxy/` 目录
-2. 新建 `proxy/__init__.py`（空文件）
-3. 新建 `proxy/proxy_server.py`，基于 `aiohttp.web` 实现：
-
-```python
-"""
-最小 vLLM Proxy 服务器
-
-架构:
-  Client (run_benchmark.py)
-    → Proxy (port 9000)
-      → vLLM Backend (port 8000)
-
-功能:
-  - 接收 /v1/chat/completions 请求
-  - SSE 流式逐 chunk 转发（不缓冲）
-  - 排队、控制并发、按 window 分组
-  - 记录自身指标
-  - /proxy/metrics 暴露指标 JSON
-  - /internal/config/proxy 热更新参数
-"""
-
-class ProxyServer:
-    def __init__(self, config: dict):
-        """
-        config 包含:
-        - backend_url: str (如 "http://127.0.0.1:8000")
-        - host: str (如 "0.0.0.0")
-        - port: int (如 9000)
-        - batching_window_ms: int (初始 0)
-        - max_concurrency: int (初始 32)
-        - admission_threshold: float (初始 1.0)
-        - queue_size_limit: int (如 100)
-        - request_timeout_s: int (如 120)
-        """
-
-    async def handle_chat_completions(self, request):
-        """处理 /v1/chat/completions 请求"""
-        # 1. admission check
-        # 2. 入队
-        # 3. 等待 batching window 或队列满
-        # 4. 获取 semaphore
-        # 5. 转发给后端
-        # 6. 流式回传响应给客户端
-
-    async def handle_health(self, request):
-        """代理层健康检查，同时检查后端"""
-
-    async def handle_proxy_metrics(self, request):
-        """GET /proxy/metrics — 返回 proxy 自身指标 JSON"""
-
-    async def handle_config_update(self, request):
-        """POST /internal/config/proxy — 热更新 proxy 参数"""
-
-    async def handle_passthrough(self, request):
-        """非 /v1/chat/completions 的请求直接透传给后端"""
-
-    def get_metrics_snapshot(self) -> dict:
-        """
-        返回当前指标快照:
-        {
-            "queue_depth": int,
-            "in_flight": int,
-            "total_requests": int,
-            "total_forwarded": int,
-            "total_rejected": int,
-            "total_batches": int,
-            "avg_batch_size": float,
-            "avg_queue_latency_ms": float,
-            "rejection_rate": float,
-            "current_config": {
-                "batching_window_ms": int,
-                "max_concurrency": int,
-                "admission_threshold": float
-            }
-        }
-        """
-```
-
-4. 新建 `configs/proxy/proxy_config.json`：
-
-```json
-{
-  "proxy": {
-    "host": "0.0.0.0",
-    "port": 9000,
-    "backend_url": "http://127.0.0.1:8000",
-    "batching_window_ms": 0,
-    "max_concurrency": 32,
-    "admission_threshold": 1.0,
-    "queue_size_limit": 100,
-    "request_timeout_s": 120,
-    "log_level": "INFO"
-  }
-}
-```
-
-5. 新建 `scripts/server/launch_proxy.sh`：
-
-```bash
-#!/bin/bash
-source ~/vllm-venv/bin/activate
-export no_proxy="*"
-cd /mnt/d/vlllm
-python3 proxy/proxy_server.py --config configs/proxy/proxy_config.json
-```
-
-**关键要求**：
-- 第一版 proxy 的 `batching_window_ms=0` 和 `admission_threshold=1.0`（即不做任何控制），验证纯转发不引入额外延迟
-- SSE 流式响应必须逐 chunk 转发，不能缓冲后一次性返回
-- 对非 `/v1/chat/completions` 的请求直接透传给后端
-
-**产出物**：`proxy/proxy_server.py`、`proxy/__init__.py`、`configs/proxy/proxy_config.json`、`scripts/server/launch_proxy.sh`
-
-**验证**：
-1. 启动 vLLM 后端 (port 8000)
-2. 启动 proxy (port 9000)
-3. `curl http://127.0.0.1:9000/health` 返回 200
-4. `python3 scripts/verify/verify_server.py --port 9000` 三项检查全部通过
-5. `python3 benchmarks/run_benchmark.py --host 127.0.0.1 --port 9000 --num-requests 3` 成功
-6. 对比直连和经 proxy 的延迟差异小于 10%
-
----
-
-### Task 5.2: 实现 batching window
-
-**目标**：proxy 支持在 window 时间内累积请求后批量触发转发。
+**目标**：在 A6000 主机上搭好 WSL2/Linux + CUDA + vLLM 环境，版本与 4060 侧保持一致以减少差异。
 
 **操作**：
-1. 在 `proxy/proxy_server.py` 中实现 batching window 机制：
-   - 收到请求后放入 pending 队列
-   - 启动 window 计时器（`batching_window_ms`）
-   - window 到期时触发 batch 转发
-   - 如果 pending 队列在 window 未到期时已达到 max_concurrency，提前触发
-2. 每个 batch 记录 `batch_id`、`batch_size`、`formation_time_ms`
-3. 在 proxy metrics 中新增 `total_batches`、`avg_batch_size`
-
-**产出物**：`proxy/proxy_server.py` 的更新
-
-**验证**：
-```bash
-# 修改 configs/proxy/proxy_config.json: "batching_window_ms": 200
-# 运行并发测试
-python3 benchmarks/run_benchmark.py --host 127.0.0.1 --port 9000 --num-requests 10 --concurrency 4
-# 检查 curl http://127.0.0.1:9000/proxy/metrics 中 avg_batch_size > 1
-```
-
----
-
-### Task 5.3: 实现 max concurrency 控制
-
-**目标**：proxy 限制同时转发给后端的活跃请求数。
-
-**操作**：
-1. 用 `asyncio.Semaphore(max_concurrency)` 控制并发
-2. 超过并发限制的请求在 proxy 内排队（不是拒绝）
-3. 在 proxy metrics 中实时更新 `in_flight`、`queue_depth`、`avg_queue_latency_ms`
-4. 日志记录并发饱和事件
-
-**产出物**：`proxy/proxy_server.py` 的更新
-
-**验证**：
-```bash
-# 设置 max_concurrency=2, 发送 10 个请求 concurrency=8
-# curl http://127.0.0.1:9000/proxy/metrics 应显示 in_flight <= 2
-```
-
----
-
-### Task 5.4: 实现 admission threshold
-
-**目标**：当 proxy 队列压力超过阈值时拒绝新请求。
-
-**操作**：
-1. 计算 `load_ratio = queue_depth / queue_size_limit`
-2. 当 `load_ratio >= admission_threshold` 时，返回 HTTP 429 + JSON 错误体：
-   ```json
-   {"error": {"message": "Server overloaded, please retry later", "type": "overloaded", "queue_depth": 50, "threshold": 0.9}}
+1. 登录 A6000 主机，确认硬件：
+   ```bash
+   nvidia-smi                   # 确认 A6000 48 GB, 驱动 ≥ 550, CUDA 12.4
+   free -h && lscpu             # 确认内存 ≥ 64 GB
    ```
-3. 在 proxy metrics 中新增 `total_rejected`、`rejection_rate`
-4. 在 `benchmarks/run_benchmark.py` 中处理 HTTP 429：记录 `error: "rejected_429"`，统计中单独显示
+2. 建立独立的 Python 3.10 venv：`python3.10 -m venv ~/vllm-venv-a6000 && source ~/vllm-venv-a6000/bin/activate`
+3. 安装依赖，版本与 `requirements.txt` 对齐：
+   - `pip install "vllm==0.6.6.post1" "torch==2.5.1" "transformers==4.49.0"`
+   - `pip install -r requirements.txt`
+4. 运行 `python3 scripts/tools/collect_sysinfo.py`，产出物保存为 `docs/env_a6000.md`（和原 4060 的 `env_4060.md` 并列保留）。
+5. 在仓库根新建 `docs/migration_a6000.md` 记录：驱动版本、CUDA、Python、vLLM 及安装过程中的任何坑点。
 
-**产出物**：`proxy/proxy_server.py` 和 `benchmarks/run_benchmark.py` 的更新
+**产出物**：`~/vllm-venv-a6000/`、`docs/env_a6000.md`、`docs/migration_a6000.md`
 
 **验证**：
 ```bash
-# 设置 queue_size_limit=5, admission_threshold=0.8, max_concurrency=1
-# 发送 20 个并发请求
-python3 benchmarks/run_benchmark.py --host 127.0.0.1 --port 9000 --num-requests 20 --concurrency 20
-# summary 中应出现部分 rejected_429 错误
+python3 -c "import torch, vllm; print(torch.cuda.get_device_name(0), vllm.__version__)"
+# 期望输出: NVIDIA RTX A6000 0.6.6.post1
 ```
 
 ---
 
-### Task 5.5: /proxy/metrics 端点
+### Task 5.2: Qwen3-8B 模型获取与量化选型
 
-**目标**：暴露 proxy 运行时指标。
+**目标**：选定 Qwen3-8B 的发布版本与量化精度，下载模型到 `~/models/`。
+
+**选型决策**（写入 `docs/model_choice_qwen3_8b.md`）：
+
+| 候选 | 权重大小 | 预估 KV cache 余量（A6000 48 GB）| 适用场景 |
+|------|----------|-----------------------------------|----------|
+| Qwen3-8B bf16 | ~16 GB | ~28 GB | **本项目默认**（A6000 显存充足，精度无损，避免量化带来的性能噪声） |
+| Qwen3-8B-AWQ (4-bit) | ~5 GB | ~39 GB | 想放大 `max_num_seqs` 看 KV 压力场景时备用 |
+| Qwen3-8B-GPTQ-Int8 | ~9 GB | ~34 GB | 仅做对照备用 |
+
+**决策**：**默认使用 Qwen3-8B bf16**。理由：
+1. A6000 48 GB 显存足够，无需量化换空间；
+2. 避免量化 kernel（AWQ/GPTQ）与 chunked prefill、partial prefills 的未知交互；
+3. 作为调参实验的基准，权重精度对调参相对影响 **必须可复现**，bf16 是最干净的控制变量。
 
 **操作**：
-1. 实现 `GET /proxy/metrics`，返回 JSON 格式的 `get_metrics_snapshot()` 结果
-2. 包含字段（Task 5.1-5.4 中已定义）：
-   - `queue_depth`, `in_flight`, `total_requests`, `total_forwarded`, `total_rejected`
-   - `total_batches`, `avg_batch_size`, `avg_queue_latency_ms`, `rejection_rate`
-   - `current_config`（当前 proxy 参数快照）
-   - `uptime_s`
+1. 下载模型到 `~/models/Qwen3-8B`（使用 `scripts/setup/download_model.sh`，修改默认模型 ID）：
+   ```bash
+   huggingface-cli download Qwen/Qwen3-8B --local-dir ~/models/Qwen3-8B
+   ```
+2. 校验：
+   ```bash
+   ls ~/models/Qwen3-8B/config.json
+   python3 -c "from transformers import AutoConfig; c=AutoConfig.from_pretrained('~/models/Qwen3-8B'); print(c.model_type, c.hidden_size, c.num_hidden_layers)"
+   ```
 
-**产出物**：如已在前面 Task 中实现则确认完整性即可
-
-**验证**：`curl -s http://127.0.0.1:9000/proxy/metrics | python3 -m json.tool` 输出格式正确
+**产出物**：`~/models/Qwen3-8B/`、`docs/model_choice_qwen3_8b.md`
 
 ---
 
-### Task 5.6: /internal/config/proxy 热更新 API
+### Task 5.3: 配置与 Profile 适配
 
-**目标**：支持外部控制器动态更新 proxy 参数。
+**目标**：把所有 `configs/` 下的模型名、端口、上下文长度等参数从 3B-AWQ 替换为 Qwen3-8B，并重新定义 baseline 与 profile。
 
 **操作**：
-1. 实现 `POST /internal/config/proxy`：
+1. 新建 `configs/experiments/baseline_a6000_0.json`，关键字段：
    ```json
    {
-     "batching_window_ms": 20,
-     "max_concurrency": 16,
-     "admission_threshold": 0.9
+     "experiment": {"name": "baseline_a6000_0", "description": "A6000 + Qwen3-8B 首个 baseline"},
+     "model": {"name": "Qwen/Qwen3-8B", "dtype": "bfloat16", "quantization": null, "max_model_len": 4096, "trust_remote_code": true},
+     "server": {"host": "0.0.0.0", "port": 8000, "tensor_parallel_size": 1, "gpu_memory_utilization": 0.90, "max_num_seqs": 64, "enforce_eager": false, "api_type": "openai"},
+     "sampling": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 256, "stop": null},
+     "benchmark": {"num_requests": 50, "concurrency": 1}
    }
    ```
-2. 更新立即生效（修改公共配置对象，新请求使用新参数）
-3. 返回更新后的完整配置：
-   ```json
-   {"status": "ok", "previous": {...}, "current": {...}}
+2. 新建 `configs/profiles/profile_{L,B,T}.json`（替换旧的 3B 版 profile 概念，新 profile 针对 A6000 + 8B 重新标定）：
+   - **L (低延迟)**：`max_num_seqs=32, max_model_len=2048, enable_prefix_caching=false, enable_chunked_prefill=true`
+   - **B (平衡，默认)**：`max_num_seqs=64, max_model_len=4096, enable_prefix_caching=false, enable_chunked_prefill=true`
+   - **T (高吞吐)**：`max_num_seqs=128, max_model_len=4096, enable_prefix_caching=true, enable_chunked_prefill=true`
+3. 修改 `scripts/server/start_server.sh`：
+   - 默认 config 指向 `configs/experiments/baseline_a6000_0.json`；
+   - 模型路径解析时，`~/models/Qwen3-8B` 命中则走离线；
+   - 增加 `--enforce-eager` 可选透传（`$2` 为 `eager` 时追加该 flag），供 Week 6 粗搜调用。
+4. 更新 `configs/workloads/*.json` 中依赖上下文长度的字段：
+   - prompt 长度上限从 1024 放宽到 2048（8B 能处理更长上下文）；
+   - `max_tokens` 默认从 256 提到 512；
+   - 保留原 14 份 workload 预设（到达/长度/前缀三轴），仅调整长度范围。
+
+**产出物**：`configs/experiments/baseline_a6000_0.json`、`configs/profiles/profile_{L,B,T}.json`、改动后的 `scripts/server/start_server.sh`、14 份 workload 更新
+
+**验证**：`bash scripts/server/start_server.sh configs/experiments/baseline_a6000_0.json`，观察 `/health` 返回 200，`/metrics` 含 `vllm:cache_config_info{model_name="/home/.../Qwen3-8B"}` 行。
+
+---
+
+### Task 5.4: 测试与监控适配
+
+**目标**：确保 76 个既有单元测试在新平台 + 新模型上全部通过。
+
+**操作**：
+1. 全仓库搜索硬编码字符串 `Qwen2.5-3B-Instruct-AWQ`、`max_model_len.*2048`、`max_num_seqs.*32`，凡是作为测试 fixture 默认值的都改为 Qwen3-8B 的对应值；
+2. `monitors/vllm_metrics_collector.py` 的指标名校验若有硬编码 `model_name` 匹配，改为通配或参数化；
+3. `tests/` 下涉及到启动 vLLM 的集成测试若用到真实模型，统一通过 fixture `model_path` 注入，默认 `~/models/Qwen3-8B`；
+4. 在 `tests/conftest.py`（若无则新建）中加入一个 `skip_if_no_gpu` marker，跳过没有 GPU 的 CI 环境。
+
+**产出物**：更新后的 `tests/`、`tests/conftest.py`
+
+**验证**：
+```bash
+bash scripts/test/run_all_tests.sh
+# 期望: 76 passed（如有因 8B 模型加载时间超过 pytest timeout 而失败的，调大 timeout，不允许 skip）
+```
+
+---
+
+### Task 5.5: A6000 + Qwen3-8B 新 Baseline
+
+**目标**：在新平台上重新跑一次 50 请求、concurrency=1 的冷启动 baseline，作为后续调参的对照基准。
+
+**操作**：
+1. 启动服务：`bash scripts/server/start_server.sh configs/experiments/baseline_a6000_0.json`；
+2. 运行压测：
+   ```bash
+   python3 benchmarks/run_benchmark.py \
+     --config configs/experiments/baseline_a6000_0.json \
+     --workload configs/workloads/workload_baseline.json \
+     --host 127.0.0.1
    ```
-4. 校验参数合法性：
-   - `batching_window_ms` ∈ [0, 500]
-   - `max_concurrency` ∈ [1, 64]
-   - `admission_threshold` ∈ [0.5, 1.0]
-5. 非法参数返回 400
+3. 记录 `results/<experiment_id>/summary.json` 中的：
+   - `throughput_req_per_s`, `throughput_tokens_per_s`
+   - `ttft_ms` (mean/p95)
+   - `tpot_ms` (mean/p95)
+   - `latency_ms` (mean/p95/p99)
+   - `preemption_total`（从 metrics_timeseries 推出，Week 6 会正式纳入）
+4. 在 `_issue_body.md` 中追加 **"Baseline A6000-0"** 条目，格式与 Baseline 0 一致。
 
-**产出物**：`proxy/proxy_server.py` 的更新
+**产出物**：`results/baseline_a6000_0/`、`_issue_body.md` 更新
 
-**验证**：
-```bash
-# 更新参数
-curl -X POST http://127.0.0.1:9000/internal/config/proxy \
-  -H "Content-Type: application/json" \
-  -d '{"max_concurrency": 8}'
-# 查看生效
-curl http://127.0.0.1:9000/proxy/metrics | python3 -c "import json,sys; print(json.load(sys.stdin)['current_config'])"
-```
+**验证**：新 baseline 吞吐 ≥ 3B-AWQ baseline 的 2× 以上（8B 模型在 A6000 上 token/s 预期 >150），P95 TTFT < 300 ms。
 
 ---
 
-## 八、Week 6 — LLM Advisor + Module E (Analyzer) + Module C (Profile Manager)
+## 八、Week 6 — VTA-Agent 基础设施（框架 + 工具 + LLM 客户端）
 
-### Task 6.1: LlmAdvisor 基础设施
+> **本周目标**：把 agent 所需的**所有"可被 LLM 调用或被程序调用的"基础设施**全部打通，包括热重启、指标、内存、工具注册、LLM 客户端。本周 **不写 agent 主循环**（留到 Week 7），目标是一个 trial 能被 runner 闭环跑通，且 LlmClient 能完成一次带工具调用的对话。
 
-**目标**：建立统一的 LLM 调用封装层，供 Analyzer 和 Controller 共享。
+### Task 6.1: VllmLauncher（热重启 + ready + eager 透传 + 页缓存保留）
 
-**操作**：
-1. 新建 `llm_advisor/` 目录
-2. 新建 `llm_advisor/__init__.py`
-3. 新建 `llm_advisor/llm_advisor.py`：
-
-```python
-"""
-LLM Advisor — 统一 LLM 调用封装
-
-支持 DeepSeek / OpenAI API，提供:
-- 异步调用 (asyncio)
-- 限流: 同一时刻最多 1 个调用
-- 缓存: 相同输入 30s TTL 复用
-- 重试: 3 次指数退避 (1s→2s→4s)
-- 降级: API 不可用时返回 fallback 标记
-- 监控: 调用延迟 / 成功率 / token 计数
-"""
-import asyncio
-import hashlib
-import json
-import time
-from openai import AsyncOpenAI
-
-
-class LlmAdvisor:
-    def __init__(self, config: dict):
-        """
-        config:
-        {
-            "provider": "deepseek" | "openai",
-            "api_key": "sk-...",
-            "base_url": "https://api.deepseek.com" | null,
-            "model": "deepseek-chat" | "gpt-4o-mini",
-            "temperature": 0.3,
-            "max_tokens": 500,
-            "timeout_s": 30,
-            "cache_ttl_s": 30,
-            "max_retries": 3
-        }
-        """
-
-    async def analyze_state(self, metrics_snapshot: dict) -> dict:
-        """
-        E-LLM-1+2: 状态语义化 + 负载模式识别
-        输入: 聚合指标快照
-        输出: AnalyzerState dict（含 bottleneck_type, dominant_pattern 等）
-        降级: 返回 {"llm_source": "fallback", ...} + 规则引擎基础分类
-        """
-
-    async def select_strategy(self, analyzer_state: dict,
-                               current_config: dict,
-                               action_space: dict,
-                               decision_history: list[dict]) -> dict:
-        """
-        F-LLM-1: 策略选择 + 动作决策
-        输入: 语义状态 + 当前配置 + 可用动作 + 历史
-        输出: ControllerDecision dict
-        降级: 返回 {"action_type": "none", "llm_source": "fallback"}
-        """
-
-    async def prune_search_space(self, analyzer_state: dict,
-                                  full_space: dict,
-                                  trial_history: list[dict]) -> dict:
-        """
-        F-LLM-2: Optuna 搜索空间裁剪
-        输入: 状态 + 完整空间 + trial 历史
-        输出: {"constrained_space": {...}, "fixed_params": {...}}
-        降级: 返回完整空间不裁剪
-        """
-
-    async def _call_llm(self, system_prompt: str,
-                         user_prompt: str,
-                         output_schema: dict | None = None) -> dict:
-        """
-        底层 LLM 调用（含缓存/限流/重试/解析）
-        """
-
-    def get_stats(self) -> dict:
-        """
-        返回 LLM 调用统计:
-        {
-            "total_calls": int,
-            "successful_calls": int,
-            "failed_calls": int,
-            "fallback_calls": int,
-            "cache_hits": int,
-            "avg_latency_ms": float,
-            "total_input_tokens": int,
-            "total_output_tokens": int
-        }
-        """
-```
-
-2. 新建 `configs/llm_advisor/llm_advisor_config.json`：
-
-```json
-{
-  "llm_advisor": {
-    "provider": "deepseek",
-    "api_key": "${DEEPSEEK_API_KEY}",
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-chat",
-    "temperature": 0.3,
-    "max_tokens": 500,
-    "timeout_s": 30,
-    "cache_ttl_s": 30,
-    "max_retries": 3
-  }
-}
-```
-
-**注意**：`api_key` 从环境变量 `DEEPSEEK_API_KEY`（或 `OPENAI_API_KEY`）读取，配置文件中的 `"${...}"` 只是占位符。
-
-**产出物**：`llm_advisor/llm_advisor.py`、`llm_advisor/__init__.py`、`configs/llm_advisor/llm_advisor_config.json`
-
-**验证**：
-```bash
-export DEEPSEEK_API_KEY="your-key-here"
-python3 -c "
-import asyncio
-from llm_advisor.llm_advisor import LlmAdvisor
-import json
-
-config = json.load(open('configs/llm_advisor/llm_advisor_config.json'))['llm_advisor']
-config['api_key'] = '$DEEPSEEK_API_KEY'  # 从环境变量
-
-advisor = LlmAdvisor(config)
-
-# 测试基础连通性
-result = asyncio.run(advisor._call_llm(
-    system_prompt='你是一个测试助手，请只返回JSON',
-    user_prompt='请返回 {\"status\": \"ok\"}'
-))
-print('LLM 连通:', result)
-print('Stats:', advisor.get_stats())
-"
-```
-
----
-
-### Task 6.2: 4 套 Prompt 模板
-
-**目标**：为每个 LLM 调用点创建可维护的 prompt 模板。
+**目标**：把一份参数字典 → 重启 vLLM + 就绪检查封装成原子调用，并尽量压低重启墙钟。
 
 **操作**：
-1. 新建 `configs/llm_prompts/` 目录
-2. 新建 4 个模板文件（JSON 格式，每个包含 system_prompt + user_prompt_template + output_schema + few_shot_examples）：
-   - `configs/llm_prompts/state_analysis.json` — E-LLM-1+2 合并模板
-   - `configs/llm_prompts/strategy_selection.json` — F-LLM-1 模板
-   - `configs/llm_prompts/search_pruning.json` — F-LLM-2 模板
-   - `configs/llm_prompts/few_shot_examples.json` — 共享的 few-shot 数据（Task 4.6 产出）
-
-3. 模板格式：
-
-```json
-{
-  "template_id": "state_analysis",
-  "version": "1.0",
-  "system_prompt": "你是 vLLM 推理服务的性能分析专家...",
-  "user_prompt_template": "## 系统指标快照\n\n### 实时值\n- GPU 利用率: {gpu_util_pct}%\n...",
-  "output_schema": {
-    "type": "object",
-    "required": ["bottleneck_type", "dominant_pattern", "risk_level"],
-    "properties": {}
-  },
-  "few_shot_examples": [
-    {
-      "scenario": "长输出解码瓶颈",
-      "input_summary": "GPU 92%, TPOT P95 18ms 上升, KV cache 87%",
-      "expected_output": {"bottleneck_type": "decode", "dominant_pattern": "long_decode", "risk_level": "warning"}
-    }
-  ]
-}
-```
-
-4. system_prompt 和 user_prompt_template 的内容来自本文件第三章（3.2/3.3/3.4 节）
-5. few-shot 示例应使用 Task 4.6 的真实实验数据。如果 Task 4.6 尚未运行，先用合理的占位数据，后续替换
-
-**产出物**：`configs/llm_prompts/` 下 4 个 JSON 文件
-
-**验证**：`python3 -c "import json; [json.load(open(f'configs/llm_prompts/{f}.json')) for f in ['state_analysis','strategy_selection','search_pruning']]"`
-
----
-
-### Task 6.3: Analyzer 规则核心
-
-**目标**：实现 Analyzer 的数值计算层（不含 LLM 部分）。
-
-**操作**：
-1. 新建 `analyzer/` 目录
-2. 新建 `analyzer/__init__.py`
-3. 新建 `analyzer/analyzer.py`：
-
-```python
-"""
-Analyzer — 系统状态分析器
-
-架构:
-  规则层（本模块）: 滑动窗口聚合 + 数值特征计算 + 基础阈值分类
-  认知层（LLM）: 状态语义化理解 + 负载模式识别（在 Task 6.4 集成）
-"""
-import collections
-import statistics
-import time
-
-
-class MetricsWindow:
-    """固定时间窗口的指标聚合器"""
-
-    def __init__(self, window_seconds: int):
-        """window_seconds: 窗口大小（秒）"""
-
-    def add(self, timestamp: float, metrics: dict):
-        """添加一个指标数据点"""
-
-    def get_aggregated(self) -> dict:
-        """返回窗口内的聚合统计（mean/median/p95/min/max/slope）"""
-
-
-class Analyzer:
-    """系统状态分析器（规则核心）"""
-
-    def __init__(self, config: dict = None):
-        """
-        内部维护三个窗口: 10s, 30s, 60s
-        """
-
-    def ingest_request_metrics(self, request_result: dict):
-        """注入单个请求的指标（TTFT/TPOT/latency/output_tokens）"""
-
-    def ingest_gpu_sample(self, sample: dict):
-        """注入一个 GPU 采样点"""
-
-    def ingest_vllm_metrics(self, metrics: dict):
-        """注入一次 vLLM /metrics 采集结果"""
-
-    def ingest_proxy_metrics(self, metrics: dict):
-        """注入 proxy /proxy/metrics 快照"""
-
-    def get_rule_based_state(self) -> dict:
-        """
-        规则引擎初筛 — 仅用阈值和统计方法，不调用 LLM。
-        返回:
-        {
-            "windows": {
-                "10s": {"ttft_mean": ..., "ttft_p95": ..., "tpot_mean": ..., ...},
-                "30s": {...},
-                "60s": {...}
-            },
-            "realtime": {
-                "gpu_util_pct": ...,
-                "mem_util_pct": ...,
-                "kv_cache_pct": ...,
-                "queue_depth": ...,
-                "in_flight": ...,
-                "reject_rate_30s": ...
-            },
-            "request_stats_30s": {
-                "avg_prompt_len": ...,
-                "avg_output_len": ...,
-                "prefix_ratio": ...,
-                "arrival_rate": ...,
-                "arrival_cv": ...
-            },
-            "rule_classification": {
-                "load_level": "low" | "medium" | "high" | "burst",
-                "risk_level": "safe" | "warning" | "critical",
-                "preliminary_bottleneck": "prefill" | "decode" | "memory" | "queue" | "none"
-            }
-        }
-        """
-
-    def _classify_load_level(self, metrics: dict) -> str:
-        """基于 queue_depth 阈值的负载分级"""
-        # low: queue_depth <= 2
-        # medium: 3-10
-        # high: 11-30
-        # burst: >30
-
-    def _classify_risk_level(self, metrics: dict) -> str:
-        """基于 SLO 阈值的风险分级"""
-        # safe: TTFT_p95 < 150ms & latency_p95 < 3000ms
-        # warning: TTFT_p95 < 200ms & latency_p95 < 5000ms (SLO 边界)
-        # critical: 任一指标超 SLO
-
-    def _classify_bottleneck(self, metrics: dict) -> str:
-        """基于数值特征的初步瓶颈判定"""
-        # decode: TPOT 上升 & GPU 利用率高
-        # prefill: TTFT 上升 & 队列不长
-        # memory: KV cache > 85%
-        # queue: queue_depth 快速增长
-        # none: 无明显瓶颈
-```
-
-**产出物**：`analyzer/analyzer.py`、`analyzer/__init__.py`
-
-**验证**：
-```bash
-python3 -c "
-from analyzer.analyzer import Analyzer
-import time
-
-a = Analyzer()
-# 模拟注入数据
-for i in range(20):
-    a.ingest_request_metrics({
-        'ttft_ms': 60 + i, 'tpot_ms': 12 + i*0.5,
-        'latency_ms': 2700 + i*50, 'output_tokens': 200,
-        'prompt_length_bucket': 'medium'
-    })
-    a.ingest_gpu_sample({'gpu_util_pct': 80+i, 'mem_util_pct': 70+i, 'timestamp_s': i*0.5})
-    time.sleep(0.01)
-
-state = a.get_rule_based_state()
-print('Load:', state['rule_classification']['load_level'])
-print('Risk:', state['rule_classification']['risk_level'])
-print('Bottleneck:', state['rule_classification']['preliminary_bottleneck'])
-print('Rules OK')
-"
-```
-
----
-
-### Task 6.4: Analyzer LLM 集成
-
-**目标**：在规则核心之上集成 LLM 认知层。
-
-**操作**：
-1. 在 `analyzer/analyzer.py` 的 `Analyzer` 类中新增方法：
-
-```python
-    async def get_full_state(self, llm_advisor: 'LlmAdvisor' = None) -> dict:
-        """
-        完整状态分析 = 规则初筛 + LLM 语义理解
-
-        如果 llm_advisor 提供且可用:
-          调用 E-LLM-1+2，返回完整语义状态
-        否则:
-          返回规则初筛结果 + llm_source="fallback"
-        """
-
-    def _prepare_llm_input(self, rule_state: dict) -> dict:
-        """将规则引擎的输出格式化为 LLM prompt 需要的指标快照"""
-```
-
-2. 输出的 `AnalyzerState` 统一格式：
-
-```python
-{
-    # 来自规则层
-    "windows": {...},
-    "realtime": {...},
-    "request_stats_30s": {...},
-    "rule_classification": {...},
-
-    # 来自 LLM 认知层（或降级为规则映射）
-    "state_description": "中文状态描述",
-    "bottleneck_type": "decode",
-    "bottleneck_confidence": 0.85,
-    "trend": "degrading",
-    "risk_level": "warning",      # LLM 可能修正规则层的判定
-    "risk_signals": [...],
-    "dominant_pattern": "long_decode",
-    "pattern_confidence": 0.78,
-    "arrival_characteristic": "steady",
-    "reasoning": "...",
-
-    # 元数据
-    "llm_source": "deepseek" | "openai" | "fallback",
-    "llm_latency_ms": 1234,
-    "timestamp": 1234567890.123
-}
-```
-
-3. LLM 认知analyzer/analyzer.py` 的更新
-
-**验证**：
-```bash
-# 需要设置 DEEPSEEK_API_KEY 环境变量
-export DEEPSEEK_API_KEY="your-key"
-python3 -c "
-import asyncio
-from analyzer
-
-config = json.load(open('configs/llm_advisor/llm_advisor_config.json'))['llm_advisor']
-import os; config['api_key'] = os.environ['DEEPSEEK_API_KEY']
-advisor = LlmAdvisor(config)
-a = Analyzer()
-
-# 注入模拟数据
-for i in range(10):
-    a.ingest_request_metrics({'ttft_ms': 60+i, 'tpot_ms': 15, 'latency_ms': 3000, 'output_tokens': 200, 'prompt_length_bucket': 'medium'})
-    a.ingest_gpu_sample({'gpu_util_pct': 90, 'mem_util_pct': 80, 'timestamp_s': i})
-
-state = asyncio.run(a.get_full_state(advisor))
-print('LLM source:', state.get('llm_source'))
-print('Bottleneck:', state.get('bottleneck_type'))
-print('Pattern:', state.get('dominant_pattern'))
-print('Description:', state.get('state_description', '')[:80])
-"
-```
-
----
-
-### Task 6.5: 定义 3 个 backend profile 配置
-
-**目标**：创建 L/B/T 三个 vLLM 启动配置文件。
-
-**操作**：
-1. 每个 profile 是一个完整的 vLLM 启动配置 JSON，格式兼容 `start_server.sh`：
-
-`configs/profiles/profile_L.json`（低延迟）:
-```json
-{
-  "profile": {
-    "name": "L",
-    "description": "低延迟安全型：小 seq 数，短 context，不开 prefix caching",
-    "model": {
-      "name": "Qwen/Qwen2.5-3B-Instruct-AWQ",
-      "dtype": "auto",
-      "quantization": "awq",
-      "max_model_len": 1024,
-      "trust_remote_code": true
-    },
-    "server": {
-      "host": "0.0.0.0",
-      "port": 8000,
-      "tensor_parallel_size": 1,
-      "gpu_memory_utilization": 0.90,
-      "max_num_seqs": 16,
-      "enforce_eager": false,
-      "swap_space": 1
-    }
-  }
-}
-```
-
-`configs/profiles/profile_B.json`（平衡，与当前 baseline 一致）:
-```json
-{
-  "profile": {
-    "name": "B",
-    "description": "平衡型：中等 seq 数和 context，通用场景",
-    "model": { "max_model_len": 2048 },
-    "server": { "max_num_seqs": 32 }
-  }
-}
-```
-
-`configs/profiles/profile_T.json`（高吞吐）:
-```json
-{
-  "profile": {
-    "name": "T",
-    "description": "高吞吐型：大 seq 数，开 prefix caching，适合大量请求",
-    "model": { "max_model_len": 2048 },
-    "server": {
-      "max_num_seqs": 48,
-      "enable_prefix_caching": true
-    }
-  }
-}
-```
-
-2. 注意：Profile T 的 `max_num_seqs=48` 可能在高并发时接近显存上限。如果实测 OOM 则降到 40
-
-**产出物**：3 个 profile 配置文件
-
-**验证**：`python3 -c "import json; [json.load(open(f'configs/profiles/profile_{p}.json')) for p in 'LBT']"`
-
----
-
-### Task 6.6: ProfileManager 类
-
-**目标**：封装 vLLM 实例的 profile 切换逻辑。
-
-**操作**：
-1. 新建 `profile_manager/` 目录
-2. 新建 `profile_manager/__init__.py`
-3. 新建 `profile_manager/profile_manager.py`：
-
-```python
-"""
-ProfileManager — vLLM Backend Profile 切换管理
-
-通过 stop → start → verify 三步完成 profile 切换。
-属于"慢动作"，每次切换约 30-60 秒。
-"""
-import asyncio
-import json
-import time
-
-class ProfileManager:
-    def __init__(self, profiles_dir: str = "configs/profiles",
-                 scripts_dir: str = "scripts/server",
-                 base_url: str = "http://127.0.0.1:8000"):
-        """
-        加载 profile_L.json, profile_B.json, profile_T.json
-        """
-
-    @property
-    def current_profile(self) -> str:
-        """当前活跃 profile 名称 (L/B/T)"""
-
-    @property
-    def available_profiles(self) -> list[str]:
-        """可用 profile 列表"""
-
-    async def switch(self, target_profile: str, timeout_s: int = 120) -> dict:
-        """
-        切换到目标 profile。
-        步骤:
-        1. 调用 stop_server.sh 停止当前实例
-        2. 根据目标 profile 配置生成启动参数
-        3. 调用 start_server.sh 启动新实例（传入 profile 配置）
-        4. 轮询 /health 等待就绪
-        5. 调用 verify_server.py 确认可用
-
-        返回:
-        {
-            "success": True,
-            "previous_profile": "B",
-            "current_profile": "T",
-            "switch_duration_s": 42.3,
-            "error": None
-        }
-        """
-
-    async def _stop_backend(self) -> bool:
-        """停止当前 vLLM 实例"""
-
-    async def _start_backend(self, profile_config: dict) -> bool:
-        """用指定 profile 配置启动 vLLM"""
-
-    async def _wait_healthy(self, timeout_s: int) -> bool:
-        """轮询 /health 端点等待就绪"""
-
-    def get_profile_config(self, profile_name: str) -> dict:
-        """返回指定 profile 的完整配置"""
-```
-
-2. 要求：
-   - 使用 `asyncio.create_subprocess_exec` 调用 shell 脚本
-   - 切换过程中锁定，防止并发切换
-   - 切换失败时尝试回退到之前的 profile
-   - 切换耗时记录到日志
-
-**产出物**：`profile_manager/profile_manager.py`、`profile_manager/__init__.py`
-
-**验证**：
-```bash
-# 注意：此测试会重启 vLLM 服务，确保无正在进行的实验
-python3 -c "
-import asyncio
-from profile_manager.profile_manager import ProfileManager
-pm = ProfileManager()
-print('Current profile:', pm.current_profile)
-print('Available:', pm.available_profiles)
-# 如果有时间可以测试切换:
-# result = asyncio.run(pm.switch('L'))
-# print('Switch result:', result)
-"
-```
-
----
-
-### Task 6.7: Analyzer 集成测试
-
-**目标**：端到端验证 Monitor → Analyzer → LLM 输出链路。
-/test
-**操作**：
-
-**操作**：
-1. 新建 `scripts/test
-#!/bin/bash
-# 1. 确认 vLLM 运行中
-# 2. 运行 10 个请求的小规模压测，同时采集 GPU 和 vLLM 指标
-# 3. 将采集到的数据注入 Analyzer
-# 4. 调用 get_full_state() 获取 LLM 分析结果
-# 5. 打印完整输出，验证格式和语义
-```
-
-2. 验证点：
-   - 三个窗口聚合数值正确（不为空/NaN）
-   - 规则引擎分类结果合理
-   - LLM 返回 JSON 可解析
-   - `bottleneck_type` 和 `dominant_pattern` 为合法枚举值
-   - `state_description` 是有意义的中文描述
-   - `llm_source` 为实际使用的 provider
-
-**产出物**：`scripts/test/test_analyzer_integration.sh` + 测试输出确认
-
-**验证**：运行脚本后无报错，输出包含完整的 `AnalyzerState` 结构
-
----
-
-## 九、Week 7 — Module G (Executor) + Module F (Controller) + 闭环
-
-### Task 7.1: Executor 快路径
-
-**目标**：实现 Executor 对 proxy 快参数的热更新。
-
-**操作**：
-1. 新建 `executor/` 目录
-2. 新建 `executor/__init__.py`
-3. 新建 `executor/executor.py`：
-
-```python
-"""
-Executor — 控制决策执行器
-
-两条执行路径:
-  快路径: HTTP POST 更新 proxy 参数（毫秒级）
-  慢路径: 调用 ProfileManager 切换 backend（~45s）
-"""
-import aiohttp
-import asyncio
-import time
-
-
-class Executor:
-    def __init__(self, proxy_url: str = "http://127.0.0.1:9000",
-                 profile_manager: 'ProfileManager' = None):
-        pass
-
-    async def execute_fast(self, fast_action: dict) -> dict:
-        """
-        快路径: POST /internal/config/proxy 更新 proxy 参数
-        输入: {"batching_window_ms": 20, "max_concurrency": 16, "admission_threshold": 0.9}
-        输出: {"success": True, "path": "fast", "duration_ms": 12, "previous": {...}, "current": {...}}
-        """
-
-    async def execute_slow(self, slow_action: dict) -> dict:
-        """
-        慢路径: 切换 vLLM backend profile
-        输入: {"target_profile": "T"}
-        输出: {"success": True, "path": "slow", "duration_s": 42.3, "previous_profile": "B", "current_profile": "T"}
-        """
-
-    async def execute(self, decision: dict) -> dict:
-        """
-        统一入口: 根据 action_type 选择路径
-        - fast_only: 只执行 execute_fast
-        - slow_only: 只执行 execute_slow
-        - both: 先 fast 再 slow
-        - none: 不执行
-        """
-
-    # 配置快照栈（用于 rollback）
-    def push_config_snapshot(self, config: dict):
-        """保存当前配置快照到栈（最多 3 层）"""
-
-    def get_rollback_config(self) -> dict | None:
-        """取出上一个安全配置"""
-```
-
-**产出物**：`executor/executor.py`、`executor/__init__.py`
-
-**验证**：
-```bash
-python3 -c "
-import asyncio
-from executor.executor import Executor
-e = Executor()
-# 测试快路径（需要 proxy 在 9000 运行）
-result = asyncio.run(e.execute_fast({'max_concurrency': 16}))
-print('Fast execute:', result)
-"
-```
-
----
-
-### Task 7.2: Executor 慢路径
-
-**目标**：实现 Executor 对 vLLM backend profile 的切换。
-
-**操作**：
-1. 在 `executor/executor.py` 中实现 `execute_slow()` 方法：
-   - 调用 `ProfileManager.switch(target_profile)`
-   - 切换前保存当前完整配置快照（含 proxy + profile）
-   - 切换后验证新 profile 正常运行
-   - 切换过程中 proxy 应继续响应排队请求，返回 503（后端不可用）给新请求
-2. 在 proxy 中新增对后端不可用状态的处理：
-   - 当 Executor 通知 "switching"，proxy 对新请求返回 503 而非转发到死连接
-
-**产出物**：`executor/executor.py` 的更新 + `proxy/proxy_server.py` 中新增 503 状态处理
-
-**验证**：切换 Profile B → L → B 后服务正常（如果时间允许）
-
----
-
-### Task 7.3: Rollback + 安全机制
-
-**目标**：实现三大安全保护机制。
-
-**操作**：
-1. 在 `executor/executor.py` 中新增：
-
-```python
-    async def rollback(self, reason: str) -> dict:
-        """
-        回退到上一个安全配置。
-        触发条件（由 Safety Guard 调用）:
-        - 连续 2 个窗口 SLO 违规
-        - reject_rate > 50%
-        - profile 切换后性能明显下降
-        """
-
-    def check_cooldown(self, action_type: str) -> bool:
-        """
-        检查冷却期:
-        - 快动作: 上次快动作后 20s 内不能同方向调整
-        - 慢动作: 上次 profile 切换后 60s 内不能再次切换
-        返回 True 表示可以执行，False 表示在冷却中
-        """
-
-    def check_dwell_time(self) -> bool:
-        """
-        profile 最小驻留时间: 当前 profile 至少驻留 60s 后才能切换
-        """
-
-    def apply_action_mask(self, decision: dict, risk_level: str) -> dict:
-        """
-        动作掩码:
-        - risk=critical: 禁止 aggressive 策略，禁止增大 concurrency
-        - risk=warning: 禁止 slow_action（不在危险时切换 profile）
-        返回修正后的 decision
-        """
-```
-
-2. 所有安全机制都是**代码逻辑**，不经过 LLM
-
-**产出物**：`executor/executor.py` 的更新
-
-**验证**：单元测试冷却期和 action mask 逻辑
-
----
-
-### Task 7.4: BaseController + FixedController
-
-**目标**：定义 Controller 抽象接口和最简单的对照实现。
-
-**操作**：
-1. 新建 `controllers/` 目录
-2. 新建 `controllers/__init__.py`
-3. 新建 `controllers/base.py`：
-
-```python
-"""
-BaseController -- Controller 抽象基类
-
-所有 controller 必须实现 decide() 方法，返回统一格式的决策。
-"""
-from abc import ABC, abstractmethod
-
-class BaseController(ABC):
-    @abstractmethod
-    async def decide(self, analyzer_state: dict) -> dict:
-        """
-        输入: Analyzer 输出的完整状态
-        输出:
-        {
-            "controller_type": str,
-            "policy_mode": "conservative" | "balanced" | "aggressive" | "fixed",
-            "action_type": "fast_only" | "slow_only" | "both" | "none",
-            "fast_action": {"batching_window_ms": int, "max_concurrency": int, "admission_threshold": float} | null,
-            "slow_action": {"target_profile": str} | null,
-            "reasoning": str,
-            "confidence": float,
-            "llm_source": str | null,
-            "decision_timestamp": float
-        }
-        """
-        pass
-```
-
-4. 新建 `controllers/fixed_controller.py`：
-
-```python
-class FixedController(BaseController):
-    """固定配置 controller，作为实验对照基线"""
-
-    def __init__(self, config: dict):
-        """config 包含固定的 fast_action 参数"""
-
-    async def decide(self, analyzer_state: dict) -> dict:
-        """始终返回初始配置，不变"""
-```
-
-5. 定义 `controller_decisions.jsonl` 日志格式：
-
-```json
-{
-  "timestamp": 1234567890.123,
-  "decision_cycle": 1,
-  "controller_type": "llm_strategy",
-  "analyzer_state_summary": {"load_level": "high", "bottleneck_type": "decode", "risk_level": "warning"},
-  "decision": {"policy_mode": "conservative", "action_type": "fast_only", "fast_action": {}},
-  "execution_result": {"success": true, "path": "fast", "duration_ms": 15},
-  "llm_stats": {"latency_ms": 1200, "source": "deepseek"}
-}
-```
-
-6. 新建 `configs/controllers/controller_fixed.json`:
-```json
-{
-  "controller": {
-    "type": "fixed",
-    "params": {
-      "batching_window_ms": 0,
-      "max_concurrency": 32,
-      "admission_threshold": 1.0
-    }
-  }
-}
-```
-
-**产出物**：4 个新文件 + 1 个配置文件
-
----
-
-### Task 7.5: Safety Guard (Layer 0)
-
-**目标**：实现硬编码规则安全层，优先级最高，不经 LLM。
-
-**操作**：
-1. 新建 `controllers/safety_guard.py`：
-
-```python
-"""
-SafetyGuard -- Layer 0 安全规则检查器
-
-最高优先级，所有 controller 的决策都必须经过 Safety Guard 校验。
-使用硬编码规则，不调用 LLM，确保确定性和低延迟。
-"""
-
-class SafetyGuard:
-    def __init__(self, config: dict = None):
-        """
-        config 可覆盖默认阈值:
-        {
-            "slo_ttft_p95_ms": 200,
-            "slo_latency_p95_ms": 5000,
-            "critical_reject_rate": 0.5,
-            "critical_kv_cache_pct": 95,
-            "rollback_after_consecutive_violations": 2
-        }
-        """
-
-    def check_emergency(self, analyzer_state: dict) -> dict | None:
-        """
-        检查是否需要紧急干预。
-        如果不需要返回 None；
-        如果需要返回紧急动作:
-        {
-            "action_type": "fast_only" | "both",
-            "fast_action": {"max_concurrency": 4, "admission_threshold": 0.7},
-            "slow_action": {"target_profile": "L"} | null,
-            "reasoning": "reject_rate 超过 50%，紧急降低并发",
-            "is_emergency": True
-        }
-        """
-        # 规则 1: reject_rate > 50% -> 立即降并发到最小，收紧准入
-        # 规则 2: TTFT_p95 > SLO x 2.5 (500ms) -> 紧急降并发
-        # 规则 3: KV cache > 95% -> 切换到 Profile L（最小 context）
-        # 规则 4: 连续 2 个周期 SLO 违规 -> 触发 rollback
-
-    def validate_decision(self, decision: dict, analyzer_state: dict) -> dict:
-        """
-        校验 controller 决策是否安全。
-        修正不安全的决策（如 risk=critical 时禁止 aggressive）。
-        返回修正后的 decision。
-        """
-```
-
-**产出物**：`controllers/safety_guard.py`
-
-**验证**：单元测试各种紧急场景下的输出
-
----
-
-### Task 7.6: LLM Strategy Controller (Layer 1)
-
-**目标**：实现以 LLM 为核心的策略决策器。
-
-**操作**：
-1. 新建 `controllers/llm_strategy_controller.py`：
-
-```python
-"""
-LlmStrategyController -- Layer 1 LLM 策略控制器
-
-核心调用: F-LLM-1（策略选择 + 动作决策）
-每个决策周期 (30s) 调用一次 LLM。
-"""
-
-class LlmStrategyController(BaseController):
-    def __init__(self, llm_advisor: 'LlmAdvisor',
-                 action_space: dict,
-                 config: dict = None):
-        """
-        action_space: 可用的快慢动作空间
-        config: {
-            "decision_interval_s": 30,
-            "history_window": 5,
-            "current_fast_config": {},
-            "current_profile": "B"
-        }
-        """
-
-    async def decide(self, analyzer_state: dict) -> dict:
-        """
-        1. 将 analyzer_state + current_config + history 组装为 F-LLM-1 输入
-        2. 调用 llm_advisor.select_strategy()
-        3. 解析 LLM 输出
-        4. 记录到决策历史
-        5. 返回统一格式的 decision
-        """
-
-    def update_config(self, new_config: dict):
-        """更新当前配置（Executor 执行后回调）"""
-
-    def record_outcome(self, decision: dict, execution_result: dict, post_metrics: dict):
-        """记录决策结果用于历史参考"""
-
-    def get_decision_history(self, n: int = 5) -> list[dict]:
-        """返回最近 n 次决策及结果"""
-```
-
-2. 新建 `configs/controllers/controller_llm.json`:
-```json
-{
-  "controller": {
-    "type": "llm_strategy",
-    "decision_interval_s": 30,
-    "history_window": 5,
-    "action_space": {
-      "fast": {
-        "batching_window_ms": [0, 10, 20, 50],
-        "max_concurrency": [4, 8, 16, 32],
-        "admission_threshold": [0.7, 0.8, 0.9, 1.0]
-      },
-      "slow": {
-        "backend_profile": ["L", "B", "T"]
-      }
-    }
-  }
-}
-```
-
-**产出物**：`controllers/llm_strategy_controller.py` + `configs/controllers/controller_llm.json`
-
----
-
-### Task 7.7: 闭环集成 + 稳定性测试
-
-**目标**：把所有模块串成完整闭环并验证稳定性。
-
-**操作**：
-1. 修改 `proxy/proxy_server.py`，新增 `--controller` 参数：
-   - 加载 controller 配置
-   - 后台启动决策循环 (`asyncio.create_task`)：
-     ```
-     每 decision_interval_s 秒:
-       1. 从 monitor 获取最新指标
-       2. 注入 analyzer
-       3. 调用 analyzer.get_full_state(llm_advisor) -> state
-       4. safety_guard.check_emergency(state) -> emergency?
-       5. 如果 emergency: 直接执行 emergency action
-       6. 否则: controller.decide(state) -> decision
-       7. safety_guard.validate_decision(decision, state) -> validated
-       8. executor.check_cooldown / check_dwell_time
-       9. executor.execute(validated)
-       10. controller.record_outcome(...)
-       11. 写入 controller_decisions.jsonl
-     ```
-   - 决策循环必须 catch all exceptions，确保单次失败不崩溃
-
-2. 新建 `scripts/experiment/run_closed_loop.sh`：
-```bash
-#!/bin/bash
-# 用法: bash scripts/experiment/run_closed_loop.sh <controller_config> <workload_config>
-# 1. 确认 vLLM 后端运行中
-# 2. 启动 proxy + controller
-# 3. 运行 workload generator 压测（指向 proxy port 9000）
-# 4. 收集所有结果
-# 5. 停止 proxy
-```
-
-3. 在 `results/<experiment_id>/` 中额外输出：
-   - `controller_decisions.jsonl`: 每次决策的完整记录
-
-4. **稳定性测试**：运行以下 4 个场景，每个 5 分钟：
-   - `workload_baseline.json` (burst 混合)
-   - `workload_rate4.json` (constant rate 4 req/s)
-   - `workload_long_only.json` (全长请求)
-   - `workload_phase_switch.json` (中途切换负载)
-5. 验证标准：
-   - 无崩溃
-   - `controller_decisions.jsonl` 有 >= 5 条非 `none` 决策
-   - SafetyGuard 在 inject 高压时正确触发（如果出现高压场景）
-   - LLM 调用成功率 > 80%
-
-**产出物**：`proxy/proxy_server.py` 更新、`scripts/experiment/run_closed_loop.sh`
-
-**验证**：4 个场景各运行 5 分钟，产出完整数据，无崩溃
-
----
-
-## 十、Week 8 -- Optuna Controller + 对比实验
-
-### Task 8.1: 添加 Optuna 依赖 + 离散搜索空间
-
-**目标**：在 requirements.txt 中加入 Optuna 并定义离散搜索空间。
-
-**操作**：
-1. 在 `requirements.txt` 中添加 `optuna>=3.6.0` 和 `openai>=1.0.0`（如尚未添加）
-2. 在 WSL2 中安装：`pip install optuna openai`
-3. 定义搜索空间配置 `configs/controllers/controller_optuna.json`：
-
-```json
-{
-  "controller": {
-    "type": "optuna",
-    "study_name": "vllm_proxy_optimization",
-    "sampler": "tpe",
-    "trial_duration_s": 60,
-    "max_trials": 50,
-    "llm_pruning_enabled": true,
-    "action_space": {
-      "batching_window_ms": [0, 10, 20, 50],
-      "max_concurrency": [4, 8, 16, 32],
-      "admission_threshold": [0.7, 0.8, 0.9, 1.0],
-      "backend_profile": ["L", "B", "T"]
-    },
-    "reward": {
-      "alpha": 0.4,
-      "beta": 0.4,
-      "gamma": 0.2,
-      "slo_ttft_p95_ms": 200,
-      "slo_latency_p95_ms": 5000
-    }
-  }
-}
-```
-
-**产出物**：`requirements.txt` 更新 + `configs/controllers/controller_optuna.json`
-
-**验证**：`python3 -c "import optuna; print(optuna.__version__)"` 无报错
-
----
-
-### Task 8.2: LLM 搜索空间裁剪 (F-LLM-2)
-
-**目标**：在每个 Optuna trial 前用 LLM 缩小候选范围。
-
-**操作**：
-1. 确保 `llm_advisor/llm_advisor.py` 的 `prune_search_space()` 方法已实现（Task 6.1 中定义）
-2. 实现裁剪逻辑：
-   - 调用 F-LLM-2 prompt 模板
-   - LLM 返回 `constrained_space`（每个参数的受限候选集）和 `fixed_params`（直接固定的参数）
-   - 裁剪后的空间传给 Optuna study 的 suggest 方法
-3. 降级：LLM 不可用时使用完整搜索空间
-
-**产出物**：`llm_advisor/llm_advisor.py` 的 `prune_search_space()` 完善
-
-**验证**：
-```bash
-python3 -c "
-import asyncio, json, os
-from llm_advisor.llm_advisor import LlmAdvisor
-
-config = json.load(open('configs/llm_advisor/llm_advisor_config.json'))['llm_advisor']
-config['api_key'] = os.environ.get('DEEPSEEK_API_KEY', '')
-advisor = LlmAdvisor(config)
-
-state = {'bottleneck_type': 'decode', 'dominant_pattern': 'long_decode', 'risk_level': 'warning'}
-space = {'batching_window_ms': [0,10,20,50], 'max_concurrency': [4,8,16,32], 'admission_threshold': [0.7,0.8,0.9,1.0], 'backend_profile': ['L','B','T']}
-result = asyncio.run(advisor.prune_search_space(state, space, []))
-print('Constrained space:', result.get('constrained_space'))
-print('Fixed params:', result.get('fixed_params'))
-"
-```
-
----
-
-### Task 8.3: OptunaController
-
-**目标**：实现 Optuna ask-and-tell 控制器。
-
-**操作**：
-1. 新建 `controllers/optuna_controller.py`：
-
-```python
-"""
-OptunaController -- Layer 2 贝叶斯优化控制器
-
-使用 Optuna ask-and-tell 接口进行在线配置搜索。
-每个 trial = 一个控制窗口（60s），运行该配置后观测 reward。
-LLM (F-LLM-2) 在每个 trial 前裁剪搜索空间。
-"""
-import optuna
-
-
-class OptunaController(BaseController):
-    def __init__(self, llm_advisor: 'LlmAdvisor',
-                 safety_guard: 'SafetyGuard',
-                 config: dict):
-        """
-        创建 Optuna study (TPESampler)
-        """
-
-    async def decide(self, analyzer_state: dict) -> dict:
-        """
-        1. 如果当前 trial 还在运行中（未到 trial_duration_s）-> 返回 none
-        2. 如果当前 trial 已结束:
-           a. 计算 reward
-           b. tell(trial, reward)
-           c. 记录 trial 结果
-        3. 开始新 trial:
-           a. 调用 LLM 裁剪搜索空间 (F-LLM-2)
-           b. study.ask() 在裁剪后的空间中采样
-           c. 转换为 fast_action + slow_action
-           d. 返回 decision
-        """
-
-    def _compute_reward(self, trial_metrics: dict) -> float:
-        """
-        R = alpha * throughput_norm - beta * slo_violation_rate - gamma * reject_rate
-
-        throughput_norm: 归一化到 [0, 1]，以 baseline 0 的 75 tps 为基准
-        slo_violation_rate: SLO 违规请求比例
-        reject_rate: 被拒绝请求比例
-        """
-
-    def get_trial_history(self) -> list[dict]:
-        """返回所有 trial 的参数和 reward"""
-
-    def get_best_params(self) -> dict:
-        """返回当前最优配置"""
-```
-
-**产出物**：`controllers/optuna_controller.py`
-
-**验证**：
-```bash
-# 在闭环中运行 10 分钟（约 10 个 trial）
-bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_optuna.json configs/workloads/workload_baseline.json
-# 检查 trial 历史
-python3 -c "
-import json
-with open('results/<最新实验ID>/controller_decisions.jsonl') as f:
-    trials = [json.loads(l) for l in f if 'trial' in json.loads(l).get('decision',{}).get('reasoning','')]
-print(f'{len(trials)} trials recorded')
-"
-```
-
----
-
-### Task 8.4: 4 组对比实验
-
-**目标**：运行标准化对比实验，评估每种 controller 的效果。
-
-**操作**：
-1. 新建 `scripts/experiment/run_comparison.sh`：
-
-```bash
-#!/bin/bash
-# 4 组对比实验，同一 workload 下:
-#
-# Group A: 直连 vLLM（无 proxy）
-#   python3 benchmarks/run_benchmark.py --port 8000 --workload configs/workloads/workload_baseline.json
-#
-# Group B: proxy + FixedController（对照基线）
-#   bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_fixed.json configs/workloads/workload_baseline.json
-#
-# Group C: proxy + LlmStrategyController（规则+LLM）
-#   bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_llm.json configs/workloads/workload_baseline.json
-#
-# Group D: proxy + OptunaController（LLM+BO）
-#   bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_optuna.json configs/workloads/workload_baseline.json
-#
-# 每组运行 10 分钟，固定 workload seed=42
-# 输出到 results/comparison_<timestamp>/
-```
-
-2. 每组实验使用相同的 workload 配置和随机种子
-3. 建议使用 `workload_phase_switch.json`（包含负载切换）以展示 controller 的适应能力
-4. 汇总 4 组的 summary.json 到一个对比表
-
-**产出物**：`scripts/experiment/run_comparison.sh`
-
-**验证**：4 组实验均成功完成，`results/comparison_*/` 下各有完整数据
-
----
-
-### Task 8.5: 消融实验 + 结果汇总
-
-**目标**：通过消融实验验证各功能的贡献，生成论文所需数据。
-
-**操作**：
-1. **消融实验**（关闭单个功能观察退化）：
-   - Ablation 1: 关闭 batching window（固定 0ms）
-   - Ablation 2: 关闭 concurrency 控制（固定 32）
-   - Ablation 3: 关闭 admission control（固定 1.0）
-   - Ablation 4: 关闭 LLM（纯规则 controller）
-   - Ablation 5: 关闭 Optuna（纯 LLM controller）
-
-2. 新建 `scripts/experiment/run_ablation.sh`：
-```bash
-#!/bin/bash
-# 对每个消融组运行 5 分钟，记录性能退化
-```
-
-3. **结果汇总**：
-   - 新建 `results/comparison_summary.json`，包含所有组的对比数据
-   - 格式：
-   ```json
-   {
-     "experiment_date": "2026-05-XX",
-     "workload": "workload_phase_switch.json",
-     "groups": {
-       "direct": {"throughput_tps": 0, "ttft_p95_ms": 0, "latency_p95_ms": 0, "reject_rate": 0},
-       "fixed": {},
-       "llm_strategy": {},
-       "optuna": {}
-     },
-     "ablation": {
-       "no_batching": {},
-       "no_concurrency_control": {},
-       "no_admission": {},
-       "no_llm": {},
-       "no_optuna": {}
-     }
-   }
+1. 新建 `tuner/launcher.py`：
+   ```python
+   class VllmLauncher:
+       def __init__(self, keep_page_cache: bool = True, log_dir: Path = ...): ...
+       def start(self, config_path: Path, enforce_eager: bool = False,
+                 ready_timeout_s: int = 120) -> LaunchResult:
+           """nohup 启动 + 轮询 /health；超时抛 TimeoutError。"""
+       def stop(self, grace_s: int = 10):
+           """SIGTERM→SIGKILL；等端口释放；**不** drop_caches（保页缓存）。"""
+       def restart(self, config_path, enforce_eager=False) -> LaunchResult: ...
    ```
+2. 新建 `tuner/config_generator.py`：`render_experiment_config(base, overrides)` 深拷贝 + 点路径覆写，`write_temp_config` 落到 `/tmp/vllm_trial_<uuid>.json`。
+3. `LaunchResult` 记录 `restart_wall_time_s`、`model_load_time_s`、`cuda_graph_capture_time_s`（从 log 正则抓，缺失置 None）。
+4. `scripts/server/start_server.sh` 新增 `ENFORCE_EAGER=1` 环境变量透传 `--enforce-eager`。
 
-4. 为论文准备的关键数据点：
-   - 4 组 controller 的吞吐量/延迟/SLO 违规率对比
-   - Optuna 收敛曲线（trial_id vs reward）
-   - Controller 决策轨迹（时序图数据）
-   - 消融实验退化程度
+**验证**：eager 热启动 ≤ 30 s，graph 热启动 ≤ 60 s；两次 restart 间页缓存保留（观察 `free -m` 的 cached 列）。
 
-**产出物**：`scripts/experiment/run_ablation.sh` + `results/comparison_summary.json`
+---
 
-**验证**：所有组实验完整，对比表数据自洽
+### Task 6.2: 扩展 metrics 采集 + 产物字段补齐（Week 4 收尾）
 
+**目标**：在已有 [monitors/vllm_metrics_collector.py](monitors/vllm_metrics_collector.py) 与 [benchmarks/run_benchmark.py](benchmarks/run_benchmark.py) 基础上**只补缺口**，不改职责边界——只让"队列等待时间"指标进得来，并把已采但未聚合的 vllm 指标写进 `summary.json`。**TrialMetrics dataclass 与从产物聚合的逻辑都不在本任务，留到 Task 6.3。**
+
+**现状盘点**（无需重做）：
+- `VllmMetricsCollector` 已采 `num_requests_running / num_requests_waiting / gpu_cache_usage_pct / cpu_cache_usage_pct / num_preemptions_total`。
+- `run_benchmark.py` 已落盘 `summary.json` / `request_trace.jsonl` / `metrics_timeseries.jsonl` / `config_snapshot.json`，已聚合 ttft/tpot/latency/throughput/token_throughput。
+
+**操作**：
+1. **`monitors/vllm_metrics_collector.py`**：在 `_METRIC_PATTERNS` 中加一条 `queue_time_seconds_sum`，对应 `vllm:time_in_queue_requests_seconds_sum`（counter，单位秒）。其它 4 条已存在，**不要重复添加**。
+2. **`benchmarks/run_benchmark.py compute_stats()`**：收尾处增加一段"vLLM 时序 → summary 聚合"，输入新增参数 `vllm_samples: list[dict] | None`，写入：
+   - `preemptions_total = max(num_preemptions_total) - min(...)`（counter 差分）
+   - `preemption_rate_per_min = preemptions_total / wall_time_s * 60`
+   - `kv_cache_usage_p95_pct`：对 `gpu_cache_usage_pct` 取 P95
+   - `queue_time_delta_s`：`max(queue_time_seconds_sum) - min(...)`（供 6.3 算 P95，需要每请求队列时间则在 6.3 阶段从 `request_trace` 推导）
+   - `vllm_metrics_available: bool`：当所有样本 `source=="unavailable"` 时为 False
+3. `format_summary()` 同步追加一段"vLLM 内部指标"展示。
+4. 现有 `tests/test_vllm_metrics_collector.py` 加一个 case：mock 一份含 `vllm:time_in_queue_requests_seconds_sum 12.345` 的响应，验证字段被解析。
+
+**验证**：
+- 对一次新 baseline 跑 50 请求，`summary.json` 新增 5 个字段全部非空且数值合理（`preemption_rate_per_min ≥ 0`、`kv_cache_usage_p95_pct ∈ [0, 1]`）。
+- `metrics_timeseries.jsonl` 中 `source=="vllm"` 的行包含 `queue_time_seconds_sum` 键。
+
+---
+
+### Task 6.3: TrialMetrics + Runner（单 trial 闭环 + 在线早停）
+
+**目标**：把 6.1 的 `VllmLauncher` + 现成的 `run_benchmark.py` 串成"一个函数调一次 = 一个 trial"，并将落盘产物归一化成 `TrialMetrics` 供 agent 使用。
+
+**操作**：
+1. **新建 `tuner/metrics_parser.py`**：从 `results/<exp_id>/` 目录解析（不重新计算压测）：
+   ```python
+   @dataclass
+   class TrialMetrics:
+       throughput_req_per_s: float
+       throughput_tok_per_s: float
+       ttft_p95_ms: float
+       tpot_p95_ms: float
+       latency_p95_ms: float
+       preemptions_total: int
+       preemption_rate_per_min: float
+       kv_cache_usage_p95_pct: float
+       queue_time_p95_ms: float            # 由 metrics_parser 从 request_trace.jsonl 派生
+       success: bool
+       early_killed: bool
+       wall_time_s: float
+
+   def parse_trial(exp_dir: Path, *, early_killed: bool, wall_time_s: float) -> TrialMetrics:
+       """读 summary.json + request_trace.jsonl，组装 TrialMetrics。
+       summary 已有的字段直接搬运；queue_time_p95_ms 由请求级 (dispatch - scheduled) 取 P95。"""
+   ```
+   说明：把"按字段重命名 / 取 P95 / 兜底缺失值"的全部脏活集中在这里，run_benchmark 不再背负 trial-level 语义。
+2. **新建 `tuner/runner.py`**：
+   ```python
+   def run_trial(config_overrides: dict, workload_path: Path,
+                 enforce_eager: bool, bench_duration_s: int,
+                 early_stop_cfg: dict | None,
+                 launcher: VllmLauncher) -> TrialMetrics:
+       """
+       1. render_experiment_config + write_temp_config
+       2. launcher.restart(config_path, enforce_eager)
+       3. subprocess.run(['python','benchmarks/run_benchmark.py',
+                          '--config', cfg, '--workload', wl, '--host', '127.0.0.1'])
+          —— 复用 Week 4 已验证的压测路径，不重写
+       4. 期间另起轻量轮询线程，每 5s 抓一次 /metrics，命中早停规则 → SIGTERM 子进程 + early_killed=True
+       5. parse_trial(results/<exp_id>) → TrialMetrics
+       6. launcher.stop()
+       """
+   ```
+3. **早停规则**（默认）：启动 ≥ 20 s 后任一命中即终止——`preempt_rate > 2/s` / `throughput_tok_per_s < baseline*0.5` / `kv_cache_usage_pct > 0.98` 连续 3 次。
+
+**验证**：
+- baseline + `workload_long_only` 跑 30s：`run_trial` 返回 `early_killed=False`，全部字段非空，并能在 `results/baseline_a6000_0/` 上独立调 `parse_trial()` 复现同一 `TrialMetrics`（验证 parser 解耦）。
+- 手工把 `max_num_seqs=256, max_num_batched_tokens=1024` → 应在 ≤ 60 s 内 `early_killed=True`。
+
+---
+
+### Task 6.4: ExperienceMemory + TrialRecord + summarize()
+
+**目标**：让 agent 能在 20 步内不"失忆"——写入 / 查询 / 摘要三件事。
+
+**操作**：新建 `tuner/memory.py`：
+```python
+@dataclass
+class TrialRecord:
+    trial_id: int
+    config: dict                # 完整 config
+    delta_from_prev: dict       # {param: (old, new)}
+    hypothesis: str             # A-LLM 的 hypothesis + P-LLM 的 expected_effect
+    metrics: TrialMetrics
+    score: float
+    constraint_violations: list[str]
+    reflection: str             # R-LLM verdict + reason
+    llm_source: str             # "llm" | "fallback"
+    timestamp: float
+
+class ExperienceMemory:
+    def __init__(self, baseline: TrialMetrics): ...
+    def append(self, record: TrialRecord) -> None: ...
+    def best(self) -> TrialRecord | None: ...
+    def recent(self, n: int) -> list[TrialRecord]: ...
+    def rejected_proposals(self, n: int = 3) -> list[dict]:
+        """最近 n 条 reject 的 (param, value)。"""
+    def add_note(self, note: str) -> None: ...
+    def summarize(self, top_k: int = 3, recent_n: int = 5) -> dict:
+        """给 LLM 看的紧凑视图: {baseline, top_k_best, recent_n, notes,
+                                  tried_values_per_param, rejected}。"""
+    def dump(self, path: Path) -> None: ...   # JSONL 落盘
+```
+
+**验证**：构造 10 条伪 TrialRecord，`summarize(top_k=3, recent_n=5)` 输出 token 数 ≤ 1500（tiktoken 估算），`tried_values_per_param` 正确去重。
+
+---
+
+### Task 6.5: ParamRegistry（RESTART / RUNTIME 分层）
+
+**目标**：代码化"哪些参数可调、候选、先验说明"——`query_param_docs` 工具的数据源。
+
+**操作**：新建 `tuner/param_registry.py`：
+```python
+class MutationClass(Enum):
+    RESTART = "restart"; RUNTIME = "runtime"
+
+@dataclass
+class ParamSpec:
+    name: str
+    mutation_class: MutationClass
+    candidates: list
+    default: object
+    affects: list[str]        # ["throughput","ttft","tpot","kv","preempt"]
+    notes: str                # 一句话先验
+    depends_on: list[str] = field(default_factory=list)
+
+REGISTRY: dict[str, ParamSpec] = {
+    "max_num_batched_tokens": ParamSpec(..., RESTART, [2048,4096,8192,16384], 4096,
+        ["throughput","ttft","tpot"], "大→prefill 吞吐好，小→decode TPOT 好"),
+    "max_num_seqs":           ParamSpec(..., RESTART, [16,32,64,128], 64,
+        ["throughput","preempt","kv"], "decode 并发上限；大→吞吐高但 preempt/KV 压力升"),
+    "gpu_memory_utilization": ParamSpec(..., RESTART, [0.85,0.90,0.93,0.95], 0.90, ...),
+    "max_model_len":          ParamSpec(..., RESTART, ["auto","p95","p99"], "auto", ...),
+    "enable_prefix_caching":  ParamSpec(..., RESTART, [False,True], False, ...),
+    "enable_chunked_prefill": ParamSpec(..., RESTART, [False,True], True, ...),
+    "max_num_partial_prefills":    ParamSpec(..., RESTART, [1,2,4], 1, ...),
+    "max_long_partial_prefills":   ParamSpec(..., RESTART, [1,2], 1, ...),
+    "long_prefill_token_threshold":ParamSpec(..., RESTART, ["p75","p90"], "p90", ...),
+    # RUNTIME: 仅 reset_prefix_cache，由 agent 在 accept 新 config 前触发
+}
+```
+
+**验证**：`REGISTRY` 恰有 9 条 RESTART；`candidates` 不含 registry 默认值的非法值（如负数）。
+
+---
+
+### Task 6.6: ToolRegistry — A 类只读工具（6 个）
+
+**目标**：给 P-LLM 定义一套**安全只读**的查询接口；同时充当所有工具（A 只读 + B 算法）的统一调度入口。
+
+**操作**：新建 `tuner/tools.py`：
+```python
+class ToolRegistry:
+    def __init__(self, registry: dict, memory: ExperienceMemory,
+                 optimizer: "Optimizer | None" = None): ...
+
+    # ===== A. 只读工具 =====
+    def list_params(self) -> list[dict]: ...
+    def query_param_docs(self, name: str) -> dict:
+        """ParamSpec + 该参数在 memory 中被试过的 (value, score) 对。"""
+    def list_tried_configs(self, top_k: int = 5) -> list[dict]: ...
+    def compare_trials(self, a_id: int, b_id: int) -> dict:
+        """{params_diff, metrics_diff, score_diff}。"""
+    def get_baseline(self) -> dict: ...
+    def get_memory_notes(self) -> list[str]: ...
+
+    # ===== 给 LlmClient 用 =====
+    def openai_tools_schema(self) -> list[dict]:
+        """A + B 全部工具的 OpenAI function-calling JSON schema。"""
+    def dispatch(self, name: str, args: dict) -> dict:
+        """LLM 返回 tool_call 时查表调用；未知 name → UnknownToolError。
+        每次调用都向 llm_calls.jsonl 追加一条 {tool, args, result_summary}。"""
+```
+
+**安全**：`apply_config / rollback / restart` **绝不**进入 ToolRegistry；LLM 无法通过任何工具直接执行副作用。
+
+**验证**：`openai_tools_schema()` 能被 `openai` SDK 直接接受；`dispatch("query_param_docs", {"name": "max_num_seqs"})` 返回含 `candidates` 字段；`dispatch("apply_config", ...)` 抛 `UnknownToolError`。
+
+---
+
+### Task 6.7: Optimizer — B 类算法工具（LLM 驱动的优化算法）
+
+**目标**：把 BO / 敏感度 / Pareto / 局部网格 / 时序聚类封装成 LLM 可调用工具。LLM 决定何时触发，算法负责数值密集子任务。
+
+**操作**：新建 `tuner/optimizer.py`：
+```python
+class Optimizer:
+    def __init__(self, memory: ExperienceMemory, registry: dict):
+        self.memory = memory
+        self.registry = registry
+
+    def bo_suggest(self, scope: list[str], n: int = 1,
+                   objective: str = "score",
+                   min_history: int = 4) -> list[dict]:
+        """Optuna TPE：把 memory 中所有 trial enqueue 后 ask n 个候选。
+        返回 [{config, expected_score, acquisition, uncertainty}, ...]。
+        memory < min_history 时返回 [] + insufficient_data=True。"""
+
+    def param_sensitivity(self) -> list[dict]:
+        """对每个 param 计算: score 方差 / Spearman ρ / 单调性。
+        按敏感度降序返回。memory <4 返回 insufficient_data=True。"""
+
+    def pareto_front(self, metrics: list[str] = ("throughput_tok_per_s", "latency_p95_ms")) -> list[dict]:
+        """二/三目标朴素 O(n²) 非支配集；throughput 越大越好，latency 越小越好。"""
+
+    def local_grid(self, param: str, neighborhood: int = 2) -> list:
+        """以当前 best trial 的 param 值为中心，从 candidates 中
+        取距离 ≤ neighborhood 的、未试过的候选值。"""
+
+    def cluster_workload_phases(self, window_s: int = 30) -> dict:
+        """读 monitors 落盘的 metrics_timeseries.jsonl，
+        对 throughput 时序做 1D KMeans / change-point 检测，
+        返回 {phases: [{start_s, end_s, fingerprint}], n_phases}。"""
+```
+
+ToolRegistry 在初始化时把 `Optimizer` 实例的 5 个方法也注册进 `dispatch`，并合并到 `openai_tools_schema()`。
+
+**实现要点**：
+- `bo_suggest` 仅在 `scope` 内的参数搜索；其他参数用当前 current_config 的值固定（用 `study.enqueue_trial(fixed)` 传给 TPE）。
+- 所有工具均为**纯函数**：不写 vLLM 配置、不重启服务、不改动 memory（除日志）。
+- `acquisition` 估计：拿 TPE 的 PDF 比 `l(x)/g(x)` 作为代理；`uncertainty` 取候选周围未观测体积的简易估计。
+
+**验证**：
+- 喂入 6 条合成 trial，`bo_suggest(scope=["max_num_seqs","max_num_batched_tokens"], n=2)` 返回 2 个 config，且都在候选集内、不重复历史。
+- `param_sensitivity()` 对 6 条 trial 给出非空排序，最敏感参数与人工预期一致。
+- `pareto_front(metrics=["throughput_tok_per_s","latency_p95_ms"])` 不返回任何被支配 trial。
+- `local_grid("max_num_seqs", 2)` 在 best=64 时返回 {32, 128}（不含 64）。
+
+---
+
+### Task 6.8: LlmClient（OpenAI 兼容 + function-calling + 重试 + 缓存 + 限速）
+
+**目标**：唯一的 LLM 通道，A/P/R/Reporter 都走它。
+
+**操作**：新建 `llm_advisor/llm_client.py`：
+```python
+class LlmClient:
+    def __init__(self, base_url: str, api_key: str, model: str,
+                 rate_limit_qps: float = 1.0, cache_ttl_s: int = 60): ...
+
+    def chat(self, system: str, user: str,
+             response_format: str = "json",         # "json" 时 Prompt 末尾加 "仅输出 JSON" 保险
+             tools: list[dict] | None = None,
+             tool_handler: Callable[[str, dict], dict] | None = None,
+             max_tool_rounds: int = 5,             # A+B 工具组合可能走多轮
+             temperature: float = 0.2) -> LlmResponse:
+        """
+        完整执行 function-calling 多轮对话:
+        - 若 tools 非空: 每收到 tool_calls 就用 tool_handler 解析并回填 role=tool
+        - 最终 assistant content 解析为 JSON (若 response_format="json")
+        - 3 次指数退避重试; 同 (system+user+tools hash) 60s TTL 缓存
+        - 令牌 / 成本累计写入 LlmResponse.usage（含 tool_calls 计数）
+        """
+```
+
+**降级**：任何一次 `chat` 失败最终抛 `LlmUnavailable`；调用方（agent）捕获后走 fallback 路径。
+
+**配置**：`.env` 支持 `LLM_PROVIDER=deepseek|openai`、`LLM_MODEL`、`LLM_API_KEY`、`LLM_BASE_URL`。
+
+**验证**：
+- 对 `system="回复 OK"` 一次 chat 返回 "OK"；
+- 注入一个 `echo(msg) -> msg` 工具，让 LLM 必须调用才能回答，验证 tool_calls 多轮对话能正确闭环；
+- 同样请求第二次命中缓存（`LlmResponse.cache_hit=True`）。
+
+---
+
+## 九、Week 7 — VTA-Agent 闭环决策主脑
+
+> **本周目标**：把 Week 6 的工具 + 内存 + LlmClient 串起来，实装 A-LLM / P-LLM / R-LLM 三个决策角色 + Judge 安全网 + VtaAgent 主循环。本周跑通一种 workload（`decode_heavy`）的 end-to-end。
+
+### Task 7.1: A-LLM Diagnoser
+
+**目标**：输入最新 trial + memory 摘要，输出 diagnosis JSON。
+
+**操作**：新建 `llm_advisor/prompts.py` + `llm_advisor/diagnoser.py`：
+```python
+# prompts.py
+A_LLM_SYSTEM = """..."""    # 见 §3.2
+A_LLM_USER_TMPL = """..."""
+
+# diagnoser.py
+def diagnose(client: LlmClient, memory: ExperienceMemory,
+             latest: TrialRecord) -> DiagnosisResult:
+    """
+    1. 渲染 user prompt = A_LLM_USER_TMPL.format(...)
+    2. client.chat(A_LLM_SYSTEM, user, response_format="json") -> dict
+    3. 校验字段 bottleneck/confidence/hypothesis 存在；非法值抛 ParseError
+    4. 返回 DiagnosisResult
+    """
+```
+
+`DiagnosisResult` 含 `bottleneck / confidence / evidence / hypothesis / slo_pressure / should_stop`。
+
+**Fallback**：LLM 失败 → 规则版（preempt_rate>5 → `preempt_storm`，kv>95% → `kv_cache_pressure`，否则 `underutilized`）。
+
+**验证**：构造 3 种合成 trial（preempt 爆/吞吐低/SLO 紧），diagnoser 输出的 `bottleneck` 与预期一致 ≥ 2/3（用 fallback 分支做 golden）。
+
+---
+
+### Task 7.2: P-LLM Proposer（带工具调用）
+
+**目标**：输入 diagnosis + memory，输出 ConfigDelta。
+
+**操作**：新建 `llm_advisor/proposer.py`：
+```python
+def propose(client: LlmClient, tools: ToolRegistry,
+            memory: ExperienceMemory,
+            diagnosis: DiagnosisResult,
+            current_config: dict) -> ConfigDelta | StopSignal:
+    resp = client.chat(
+        system=P_LLM_SYSTEM,
+        user=P_LLM_USER_TMPL.format(...),
+        tools=tools.openai_tools_schema(),
+        tool_handler=tools.dispatch,
+        max_tool_rounds=3,
+    )
+    raw = json.loads(resp.content)
+    if raw["action"] == "stop":
+        return StopSignal(reason=raw["reason"])
+    # 字段校验 + 值域校验 + rejected 去重预检
+    return ConfigDelta(param=raw["param"], old_value=raw["old_value"],
+                       new_value=raw["new_value"], hypothesis_ref=...,
+                       expected_effect=raw["expected_effect"],
+                       rollback_if=raw.get("rollback_if"))
+```
+
+**Fallback**：LLM 失败 → 规则 proposer：在未试过的参数中按优先级 `[max_num_seqs, max_num_batched_tokens, gpu_memory_utilization, ...]` 选第一个未试过的 candidate 中位数。
+
+**验证**：P-LLM 至少调用一次 `query_param_docs`（观察 `LlmResponse.usage.tool_calls≥1`）；输出的 `new_value` 必在 `REGISTRY[param].candidates` 内。
+
+---
+
+### Task 7.3: R-LLM Reflector
+
+**目标**：写复盘 + 产出可复用的长期笔记。
+
+**操作**：新建 `llm_advisor/reflector.py`：
+```python
+def reflect(client: LlmClient,
+            proposal: ConfigDelta,
+            prev: TrialRecord, new: TrialRecord,
+            constraint_check: dict,
+            notes: list[str]) -> ReflectionResult:
+    ...
+```
+
+`ReflectionResult` 含 `verdict / reason / new_note / next_move_hint / hint_detail`。执行后：
+- `memory.add_note(result.new_note)`；
+- `new.reflection = result.reason`；
+- `next_move_hint` 作为下一步 A/P 的提示（写入 user prompt 的 "上一步复盘" 字段）。
+
+**Fallback**：LLM 失败 → 规则：score 提升 > 3% 且无 SLO 违反 → `accept/double_down`；否则 `reject/explore_other`；note 用模板填空。
+
+**验证**：给定已知的 "accept/improve 14%" 场景，R-LLM 输出 verdict=accept；"reject/worse" 场景输出 verdict=reject，且 `new_note` 含参数名。
+
+---
+
+### Task 7.4: Judge（值域 + SLO + 去重 + 循环防护）
+
+**目标**：agent 唯一的"硬门"，所有 P-LLM 输出必经。
+
+**操作**：新建 `tuner/judge.py`：
+```python
+class Judge:
+    def __init__(self, registry, memory, max_steps=25,
+                 slo_ttft_mult=1.2, slo_lat_mult=1.2, slo_preempt=5): ...
+
+    def check_delta(self, delta: ConfigDelta) -> JudgeVerdict:
+        """
+        1. param 在 REGISTRY 且 mutation_class=RESTART
+        2. new_value ∈ candidates
+        3. (param, new_value) 不在最近 3 条 rejected_proposals
+        4. 不重复当前最优配置
+        -> {pass, reason, suggestion_for_retry}
+        """
+    def check_trial_constraints(self, m: TrialMetrics, baseline: TrialMetrics) -> dict:
+        """返回 {pass, violations: [...]}。"""
+    def should_terminate(self, memory: ExperienceMemory) -> tuple[bool, str]:
+        """max_steps 硬上限；近 3 步 score 改动<2% 且 SLO 余量<5% → converged。"""
+    def should_early_stop_trial(self, intermediate: dict) -> tuple[bool, str]: ...
+```
+
+**验证**：给出 `new_value=999`（超出 candidates）→ Judge 拒绝；max_steps=25 到达后 `should_terminate` 返回 True。
+
+---
+
+### Task 7.5: VtaAgent 主循环
+
+**目标**：把上面全部拼成一个 `run()` 入口。
+
+**操作**：新建 `tuner/agent.py`：
+```python
+class VtaAgent:
+    def __init__(self, launcher, runner, memory, tools, judge, client, config): ...
+
+    def run(self, workload_path: Path, baseline: TrialMetrics,
+            max_steps: int = 20) -> AgentReport:
+        current_cfg = DEFAULT_CONFIG.copy()
+        # step 0: baseline 已在外部跑过，直接入 memory
+        memory.append(baseline_record)
+
+        for step in range(max_steps):
+            # 1. Observe (上一次 trial 已入 memory)
+            latest = memory.recent(1)[0]
+
+            # 2. Diagnose
+            diag = diagnose(client, memory, latest)      # fallback on LlmUnavailable
+            if diag.should_stop or judge.should_terminate(memory)[0]:
+                break
+
+            # 3. Propose (+ tools)
+            proposal = propose(client, tools, memory, diag, current_cfg)
+            if isinstance(proposal, StopSignal): break
+
+            # 4. Safety check
+            verdict = judge.check_delta(proposal)
+            if not verdict.pass_:
+                memory.record_rejected(proposal, verdict.reason)
+                continue                                  # 同 step 重试或直接下一步
+
+            # 5. Act
+            new_cfg = apply_delta(current_cfg, proposal)
+            metrics = runner.run_trial(new_cfg, workload_path, ...)
+            constraint = judge.check_trial_constraints(metrics, baseline)
+
+            # 6. Record
+            record = build_trial_record(step, new_cfg, proposal, metrics,
+                                        constraint, diag.hypothesis)
+            memory.append(record)
+
+            # 7. Reflect
+            refl = reflect(client, proposal, latest, record, constraint,
+                           memory.notes)
+            record.reflection = refl.reason
+            memory.add_note(refl.new_note)
+
+            # 8. Accept/rollback
+            if refl.verdict == "reject" or not constraint["pass"]:
+                # 不更新 current_cfg，下一步从 current_cfg 继续
+                pass
+            else:
+                current_cfg = new_cfg
+
+        return build_report(memory)
+```
+
+**验证**：对 `decode_heavy` 跑一次 end-to-end，step 数 ≤ 20，墙钟 ≤ 60 min，`AgentReport.best_trial.score > 0`，无崩溃，`results/tuning/<run_id>/memory.jsonl` 完整。
+
+---
+
+## 十、Week 8 — 对比实验与最终报告
+
+> **本周目标**：3 种 workload 完整跑 + 5 组消融 + Reporter LLM + 三张图 + final_report。
+
+### Task 8.1: Reporter LLM + final_report 生成器
+
+**目标**：结束时一次 LLM 调用，产出可直接嵌入 final_report.md 的自然语言段落。
+
+**操作**：新建 `llm_advisor/reporter.py`：
+```python
+def generate_report_section(client: LlmClient, memory: ExperienceMemory,
+                            baseline: TrialMetrics) -> str:
+    """
+    client.chat(REPORTER_SYSTEM, REPORTER_USER_TMPL.format(
+        baseline=..., full_memory=memory.dump_compact(), best=memory.best()),
+        response_format="text")
+    """
+```
+
+新建 `scripts/report/build_final_report.py`：汇总 3 份 `AgentReport` + 消融结果 → `docs/final_report.md`，章节包含:
+- 背景与目标（Score / SLO）
+- VTA-Agent 架构（ReAct 闭环 + 工具 + 内存）
+- 实验：3 workload 对比 + 5 消融对比
+- Reporter LLM 段（每个 workload 一段）
+- 讨论：LLM 贡献 / 重启成本瓶颈 / 限制
+- 附录：REGISTRY、所有 prompts、完整 memory dump
+
+**验证**：Reporter 段落 ≥ 300 字、无数字幻觉（脚本 diff：Reporter 段内每个数字都应在 memory.dump 中出现）。
+
+---
+
+### Task 8.2: run_tuning.sh 端到端 + 3 种 workload
+
+**目标**：一条命令跑完"baseline → agent → report"。
+
+**操作**：
+1. 新建 `scripts/experiment/run_tuning.sh`：
+   ```bash
+   # 用法: bash run_tuning.sh <workload_config> [--ablation=random|nomem|noreflect|fixed|noearly]
+   # 1. 若 baseline 结果不存在 → 先跑 baseline
+   # 2. python -m tuner.cli run --workload ... --ablation ...
+   # 3. 输出 results/tuning/<run_id>/{memory.jsonl, report.json, report.md}
+   ```
+2. 新建 `tuner/cli.py`（argparse 入口），`AgentReport` 落 json，`report.md` 含 Reporter 段 + 关键表格。
+3. 正式跑 3 种 workload：
+   - `workload_prefix_50.json`（prefill-heavy）
+   - `workload_long_only.json`（decode-heavy）
+   - `workload_phase_switch.json`（mixed）
+4. 汇总到 `results/tuning/summary_week8.md`（workload / baseline / best / 提升 / SLO 是否守住 / step 数 / wall time）。
+
+**验证**：3 份 report 产出；≥ 2/3 达到 ≥ 10% 吞吐提升；3/3 无 SLO 违反；单 workload 墙钟 ≤ 60 min。
+
+---
+
+### Task 8.3: 5 组消融实验
+
+**目标**：验证 agent 各组件的贡献。对 `decode_heavy` 跑：
+
+| 代号 | 消融 | 实现方式 | 预期退化点 |
+|------|------|---------|-----------|
+| **A. random-proposer** | 替换 P-LLM 为随机挑 param+value | `--ablation=random` 注入 `RandomProposer` | 找到 best 所需 step↑，最终 score↓ |
+| **B. no-memory** | `summarize()` 只返回 baseline + 最近 1 步 | `--ablation=nomem` | agent 反复试同一参数、收敛慢 |
+| **C. no-reflect** | 跳过 R-LLM，不写 notes；accept 仅看 score 差 | `--ablation=noreflect` | 无法积累 workload-specific 规律 |
+| **D. fixed-config** | 不跑 agent，直接用 `DEFAULT_CONFIG` | `--ablation=fixed` | 作为绝对下限对照（= baseline） |
+| **E. no-early-stop** | Judge 关闭 trial 早停 + 循环终止条件 | `--ablation=noearly` | 墙钟大幅↑（期望 +40%） |
+
+**产出物**：`results/tuning/ablation/{A..E}/report.json`、`ablation_summary.md`（柱状对比）。
+
+**验证**：A/B/C 的 best_score < full 的 best_score；E 的 wall_time > full 的 1.3×。
+
+---
+
+### Task 8.4: 3 张核心图 + final_report.md 定稿
+
+**目标**：毕设可用的终稿。
+
+**操作**：生成 `results/tuning/figures/`：
+- `throughput_improvement_bar.png`：3 workload × (baseline / agent best) 柱状图；
+- `agent_trajectory.png`：step id vs rolling-best score（3 workload 一张图）；
+- `ablation_bar.png`：full + 5 消融的 best_score / wall_time 对比。
+
+`docs/final_report.md` 定稿 + `_issue_body.md` 勾选 Week 5–8 全部 Task。
+
+**验证**：自读 report，每个数字都能从 `results/tuning/` 反查到；无孤立数据。
 
 ---
 
@@ -2636,7 +1996,10 @@ print(f'{len(trials)} trials recorded')
 
 ```
 configs/
-├── workloads/                       # workload 配置（Week 3-4）
+├── experiments/
+│   ├── baseline_0.json                  # Week 1-2 (4060+3B-AWQ) 历史基线
+│   └── baseline_a6000_0.json            # Week 5 A6000+Qwen3-8B 新基线
+├── workloads/                           # workload 配置（Week 3-4, Week 5 调整长度范围）
 │   ├── workload_schema.json
 │   ├── workload_baseline.json
 │   ├── workload_burst.json
@@ -2651,83 +2014,126 @@ configs/
 │   ├── workload_prefix_0.json
 │   ├── workload_prefix_50.json
 │   └── workload_prefix_90.json
-├── proxy/                           # proxy 配置（Week 5）
-│   └── proxy_config.json
-├── profiles/                        # backend profile 配置（Week 6）
-│   ├── profile_L.json
-│   ├── profile_B.json
-│   └── profile_T.json
-├── controllers/                     # controller 配置（Week 7-8）
-│   ├── controller_fixed.json
-│   ├── controller_llm.json
-│   └── controller_optuna.json
-├── llm_advisor/                     # LLM advisor 配置（Week 6）
-│   └── llm_advisor_config.json
-└── llm_prompts/                     # LLM prompt 模板（Week 6）
-    ├── state_analysis.json
-    ├── strategy_selection.json
-    ├── search_pruning.json
-    └── few_shot_examples.json
+├── profiles/                            # vLLM 启动预设（Week 5 Task 5.3 重标定）
+│   ├── profile_L.json                   # 低延迟
+│   ├── profile_B.json                   # 平衡（默认）
+│   └── profile_T.json                   # 高吞吐
+├── llm_prompts/                         # LLM prompt 模板（Week 4 旧 + Week 7-8 新）
+│   ├── few_shot_examples.json
+│   ├── a_llm_diagnose.md                # A-LLM Diagnoser（Week 7）
+│   ├── p_llm_propose.md                 # P-LLM Proposer（Week 7）
+│   ├── r_llm_reflect.md                 # R-LLM Reflector（Week 7）
+│   └── reporter.md                      # Reporter（Week 8）
+└── llm_advisor/
+    └── llm_advisor_config.json          # DeepSeek / OpenAI 切换 + 限流 + 缓存
 
-workloads/                           # Module A: Workload 生成（Week 3）
+benchmarks/                              # 压测执行（Week 2-4）
+├── run_benchmark.py                     # 已被 tuner.runner 以模块方式调用
+├── visualize_speed.py
+└── prompts.json
+
+workloads/                               # Module A: Workload 生成（Week 3）
 ├── __init__.py
 ├── workload_generator.py
 ├── prompts_pool.json
 └── prefix_pool.json
 
-monitors/                            # Module D: 基础设施监控（Week 4）
+monitors/                                # 基础设施监控（Week 4 + Week 6 Task 6.2 扩展）
 ├── __init__.py
 ├── gpu_monitor.py
 └── vllm_metrics_collector.py
 
-analyzer/                            # Module E: 系统状态分析（Week 6）
+tuner/                                   # VTA-Agent 核心（Week 6-8）
 ├── __init__.py
-└── analyzer.py
+├── config_generator.py                  # Task 6.1: 渲染 + 写临时 config
+├── launcher.py                          # Task 6.1: VllmLauncher（eager / 页缓存 / 重启计时）
+├── metrics_parser.py                    # Task 6.3: results/<exp_id>/ → TrialMetrics（产物解析）
+├── runner.py                            # Task 6.3: run_trial + 在线早停
+├── memory.py                            # Task 6.4: TrialRecord + ExperienceMemory + summarize
+├── param_registry.py                    # Task 6.5: ParamSpec REGISTRY
+├── tools.py                             # Task 6.6: ToolRegistry — A 只读 + dispatch B 算法
+├── optimizer.py                         # Task 6.7: Optimizer — BO/敏感度/Pareto/局部网格/相位聚类
+├── judge.py                             # Task 7.4: 值域 / SLO / 去重 / 循环防护
+├── agent.py                             # Task 7.5: VtaAgent 闭环主循环
+└── cli.py                               # Task 8.2: argparse 入口（支持 --ablation）
 
-llm_advisor/                         # 共享 LLM 调用封装（Week 6）
+llm_advisor/                             # LLM 调用与角色（Week 6-8）
 ├── __init__.py
-└── llm_advisor.py
-
-profile_manager/                     # Module C: Profile 切换管理（Week 6）
-├── __init__.py
-└── profile_manager.py
-
-proxy/                               # Module B: Proxy/Gateway（Week 5）
-├── __init__.py
-└── proxy_server.py
-
-controllers/                         # Module F: 控制器（Week 7-8）
-├── __init__.py
-├── base.py
-├── fixed_controller.py
-├── safety_guard.py
-├── llm_strategy_controller.py
-└── optuna_controller.py
-
-executor/                            # Module G: 执行器（Week 7）
-├── __init__.py
-└── executor.py
+├── llm_client.py                        # Task 6.8: OpenAI 兼容 + function-calling + 重试/缓存/限速
+├── prompts.py                           # Task 7.1-7.3 + 8.1: A/P/R-LLM + Reporter system/user 模板
+├── diagnoser.py                         # Task 7.1: A-LLM + fallback
+├── proposer.py                          # Task 7.2: P-LLM + tool-calling
+├── reflector.py                         # Task 7.3: R-LLM + note append
+└── reporter.py                          # Task 8.1: Reporter
 
 scripts/
 ├── server/
-│   └── launch_proxy.sh
+│   ├── launch_server.sh
+│   ├── start_server.sh                  # Week 5 改: 本地模型 + ENFORCE_EAGER 透传
+│   └── stop_server.sh
+├── setup/
+│   ├── install_all.sh
+│   ├── setup_env.sh
+│   └── download_model.sh                # Week 5 改: 默认 Qwen3-8B
 ├── experiment/
+│   ├── run_baseline.sh
 │   ├── run_experiment_suite.sh
-│   ├── run_closed_loop.sh
-│   ├── run_comparison.sh
-│   └── run_ablation.sh
-└── test/
-    ├── run_comparison.sh
-├── run_ablation.sh
-└── test_analyzer_integration.sh
+│   ├── run_initial_experiments.sh
+│   └── run_tuning.sh                    # Week 8 新增: baseline + VtaAgent + report 一键入口
+├── report/
+│   └── build_final_report.py            # Week 8 Task 8.1: 汇总 3 workload + 消融 → final_report.md
+├── verify/
+├── test/
+└── tools/
+
+tests/                                   # Week 5 Task 5.4 适配后保持全绿
+├── conftest.py                          # Week 5 新增: skip_if_no_gpu / model_path fixture
+└── test_*.py
+
+docs/
+├── research_scope.md
+├── troubleshooting.md
+├── env_4060.md                          # 历史平台
+├── env_a6000.md                         # Week 5 新增
+├── migration_a6000.md                   # Week 5 新增
+├── model_choice_qwen3_8b.md             # Week 5 Task 5.2
+└── final_report.md                      # Week 8 Task 8.5
+
+results/
+├── baseline_0/                          # 历史
+├── baseline_a6000_0/                    # Week 5
+└── tuning/                              # Week 7-8
+    ├── <run_id>/                        # 单次 agent run（workload × ablation）
+    │   ├── memory.jsonl                 # 全部 TrialRecord
+    │   ├── notes.jsonl                  # R-LLM 累积笔记
+    │   ├── llm_calls.jsonl              # A/P/R/Reporter 每次调用的 input/output/usage
+    │   ├── trials/trial_<n>/            # 每 trial 的 summary / timeseries / trace
+    │   ├── report.json                  # AgentReport 结构化
+    │   └── report.md                    # 人可读 + Reporter 段
+    ├── summary_week8.md                 # 3 workload 汇总
+    ├── ablation/{A..E}/                 # 5 组消融
+    ├── ablation_summary.md
+    └── figures/{throughput_improvement_bar,agent_trajectory,ablation_bar}.png
 ```
 
-### 修改文件（~2个）
+### 修改 / 新增关键文件一览
 
 ```
-benchmarks/run_benchmark.py    # workload集成、TPOT采集、数据落盘重构、429处理
-requirements.txt               # +optuna, +openai
+benchmarks/run_benchmark.py    # Week 3-4 已改，Week 6.2 追加 preempt/KV/queue summary 字段
+monitors/vllm_metrics_collector.py  # Week 6.2: 增采 preempt/kv/queue 指标
+scripts/server/start_server.sh # Week 5.3 改: 本地模型 + ENFORCE_EAGER 透传
+requirements.txt               # +openai>=1.0.0, +tiktoken, +python-dotenv, +optuna>=3.6.0, +scipy
 ```
+
+### 已废弃（不再产出）
+
+- `proxy/` 整个包（proxy_server.py / batching / admission 等）
+- `controllers/`（FixedController / LlmStrategyController / OptunaController / safety_guard）
+- `executor/` + `profile_manager/` + `analyzer/`
+- `workload_profiler/`（被 agent 的 Diagnoser 替代，不再做预运行分类）
+- `tuner/coarse_search.py` / `tuner/fine_search.py` / `tuner/planner.py` / `tuner/runtime_ops.py`（搜索版产物，本方案不产出）
+- 历史 prompt：`state_analysis.json` / `strategy_selection.json` / `search_pruning.json`（E-LLM-1/2, F-LLM-1/2）
+- 历史 prompt：`flm_a_classify.md` / `flm_b_prune.md` / `flm_c_explain.md`（上一搜索版 F-LLM-A/B/C）
 
 ---
 
@@ -2736,58 +2142,64 @@ requirements.txt               # +optuna, +openai
 1. **严格按 Task 顺序执行**，后续 Task 依赖前序产出物
 2. **每个 Task 完成后先验证**，再进入下一个
 3. **不要过度工程化**：只做描述中要求的内容，不要提前加功能
-4. **保持向后兼容**：旧的 `python3 benchmarks/run_benchmark.py --config configs/baseline_0.json` 必须继续能工作
-5. **LLM prompt 模板的 few-shot 示例**应优先使用 Task 4.6 的真实实验数据，而非编造
-6. **Profile T 的 max_num_seqs=48** 可能在高并发下接近 OOM 边界，实测时如 OOM 则降到 40
-7. **Optuna 探索效率**取决于 trial 数量，60s/trial 意味着 10 分钟 ≈ 10 个 trial，建议至少跑 20 分钟
-8. **phase-switch 场景**是论文亮点（证明 controller 能适应动态负载变化），Week 7 稳定性测试重点验证
+4. **保持向后兼容**：旧的 `python3 benchmarks/run_benchmark.py --config configs/experiments/baseline_0.json` 必须继续能工作
+5. **Agent 的 prompt 模板要严格要求 JSON-only 输出**：A/P/R-LLM 的 system prompt 末尾必有“仅输出 JSON”，parser 失败走 fallback
+6. **LLM 调用必须可追溯**：每次 A/P/R/Reporter 调用的 input/output/tool_calls/usage 全部落盘到 `llm_calls.jsonl`，方便复现与 debug
+7. **P-LLM 不得旁路**：LLM 的 ConfigDelta 必须经 Judge 校验；`apply_config / restart / rollback` 任何情况下都不出现在 ToolRegistry
+8. **重启成本是硬成本**：维持页缓存、早期 step 用 eager、在线早停、`should_terminate` 收敛检测 — 四件缺一不可
+9. **Memory 不要无节制填 LLM**：`summarize(top_k=3, recent_n=5)` 是默认，单次 prompt token 守在 ≤ 2000
+10. **消融 D (fixed-config)** 即 baseline——用作绝对下限对照，不要尝试优化它
 
 ---
 
 ## 十三、每周验证检查单
 
 ### Week 3 验证
-- [ ] `WorkloadGenerator(seed=42).generate()` 两次结果完全一致
-- [ ] prompt_pool ≥ 30 条，prefix_pool ≥ 5 组
-- [ ] phase-switch 在 t=30s 时切换可观测
-- [ ] `--workload` 模式和旧模式都能正常运行
+- [x] `WorkloadGenerator(seed=42).generate()` 两次结果完全一致
+- [x] prompt_pool ≥ 30 条，prefix_pool ≥ 5 组
+- [x] phase-switch 在 t=30s 时切换可观测
+- [x] `--workload` 模式和旧模式都能正常运行
 
 ### Week 4 验证
-- [ ] 小规模压测 summary 中出现 TPOT 段（mean/median/p95）
-- [ ] `GpuMonitor` 3 秒内采集 ≥5 个样本
-- [ ] `VllmMetricsCollector` 采集到 num_requests_running 或优雅降级
-- [ ] `results/<id>/` 包含 config_snapshot + request_trace.jsonl + metrics_timeseries.jsonl + summary.json
-- [ ] `few_shot_examples.json` 至少 3 个示例
+- [x] 小规模压测 summary 中出现 TPOT 段（mean/median/p95）
+- [x] `GpuMonitor` 3 秒内采集 ≥5 个样本
+- [x] `VllmMetricsCollector` 采集到 num_requests_running 或优雅降级
+- [x] `results/<id>/` 包含 config_snapshot + request_trace.jsonl + metrics_timeseries.jsonl + summary.json
+- [x] `few_shot_examples.json` 至少 3 个示例
 
-### Week 5 验证
-- [ ] `curl http://127.0.0.1:9000/health` 返回 200
-- [ ] 经 proxy 压测与直连延迟差异 <10%
-- [ ] batching_window=200ms 时 avg_batch_size > 1
-- [ ] max_concurrency=2 时 in_flight ≤ 2
-- [ ] admission_threshold=0.8 + 高并发 → 出现 429 拒绝
-- [ ] `POST /internal/config/proxy` 更新后 `/proxy/metrics` 反映新值
+### Week 5 验证（平台迁移）
+- [ ] `python3 -c "import torch, vllm; print(torch.cuda.get_device_name(0))"` → `NVIDIA RTX A6000`
+- [ ] `~/models/Qwen3-8B/config.json` 存在且 `model_type == "qwen3"`（或相应实际名）
+- [ ] `scripts/server/start_server.sh configs/experiments/baseline_a6000_0.json` 启动后 `/health` 返回 200
+- [ ] `/metrics` 含 `vllm:cache_config_info` 中的 Qwen3-8B 模型路径
+- [ ] `bash scripts/test/run_all_tests.sh` 全绿（原 76 tests + conftest fixture）
+- [ ] `results/baseline_a6000_0/summary.json` 吞吐 ≥ 3B-AWQ baseline 的 2×，P95 TTFT < 300 ms
 
-### Week 6 验证
-- [ ] `LlmAdvisor` 成功调用 DeepSeek/OpenAI API 并返回合法 JSON
-- [ ] Analyzer 规则层输出三级分类（load_level/risk_level/preliminary_bottleneck）
-- [ ] Analyzer LLM 层返回 bottleneck_type + dominant_pattern + state_description
-- [ ] `llm_source` 正确标注（deepseek/openai/fallback）
-- [ ] ProfileManager 有 3 个 profile 可列出
-- [ ] 集成测试 `test_analyzer_integration.sh` 无报错
+### Week 6 验证（VTA-Agent 基础设施）
+- [ ] `VllmLauncher.restart(enforce_eager=True)` 热启动 ≤ 30 s；`enforce_eager=False` ≤ 60 s；两次 restart 间页缓存保留
+- [ ] `VllmMetricsCollector` 对 mock 响应能解析 `vllm:time_in_queue_requests_seconds_sum`；`run_benchmark.py` summary 新增 5 个 vllm 聚合字段（preemptions_total / preemption_rate_per_min / kv_cache_usage_p95_pct / queue_time_delta_s / vllm_metrics_available）非空
+- [ ] `metrics_parser.parse_trial(results/baseline_a6000_0/)` 返回的 `TrialMetrics` 全字段非空，且与 summary.json 中 ttft/tpot/throughput 完全一致
+- [ ] `run_trial()` 对畸形 config（max_num_seqs=256, batched_tokens=1024）触发早停，返回 `early_killed=True`
+- [ ] `ExperienceMemory.summarize(top_k=3, recent_n=5)` 对 10 条伪记录的 token 数 ≤ 1500，`tried_values_per_param` 去重正确
+- [ ] `REGISTRY` 恰有 9 条 RESTART 参数；`ToolRegistry.dispatch("apply_config", ...)` 抛 `UnknownToolError`
+- [ ] `Optimizer.bo_suggest(scope=["max_num_seqs","max_num_batched_tokens"], n=2)` 在 6 条伪 trial 上返回 2 个不重复候选；memory <4 时返回 `[]` 且 `insufficient_data=True`
+- [ ] `Optimizer.param_sensitivity()` 输出按 score 方差降序，最敏感参数与人工预期一致
+- [ ] `Optimizer.pareto_front(["throughput_tok_per_s","latency_p95_ms"])` 不返回任何被支配 trial；`local_grid("max_num_seqs", 2)` 在 best=64 时返回 {32, 128}
+- [ ] `LlmClient.chat` 能完成一次 function-calling 多轮对话（注入 echo 工具验证）；同请求第二次命中缓存
 
-### Week 7 验证
-- [ ] Executor 快路径更新 proxy 参数成功（<100ms）
-- [ ] Executor 慢路径切换 profile 成功（如测试）
-- [ ] cooldown 机制阻止了过于频繁的调整
-- [ ] Safety Guard 在 inject 高指标时正确触发紧急动作
-- [ ] 闭环运行 5 分钟无崩溃
-- [ ] `controller_decisions.jsonl` 有 ≥5 条非 none 决策
-- [ ] LLM 调用成功率 > 80%
+### Week 7 验证（VTA-Agent 闭环决策）
+- [ ] `diagnose()` 对三种合成 trial（preempt 爆 / 吞吐低 / SLO 紧）输出的 `bottleneck` 与预期一致 ≥ 2/3
+- [ ] `propose()` 至少调用一次 `query_param_docs`（`LlmResponse.usage.tool_calls ≥ 1`），`new_value` 必在 `REGISTRY[param].candidates` 内
+- [ ] 当 `memory ≥ 4` 且 `diagnosis.confidence < 0.6` 的合成场景下，P-LLM 实际触发 `bo_suggest`（在 `LlmResponse.usage.tool_calls` 中可观测，且 `ConfigDelta.tools_used` 含 `bo_suggest`）
+- [ ] `reflect()` 在 accept/improve 场景输出 `verdict=accept`；reject/worse 场景输出 `verdict=reject` 且 `new_note` 含参数名
+- [ ] `Judge.check_delta` 对超出 candidates 的值拒绝；`should_terminate` 在 max_steps=25 达到时返回 True
+- [ ] `VtaAgent.run` 对 `decode_heavy` 端到端跑通：step 数 ≤ 20、墙钟 ≤ 60 min、`best_trial.score > 0`、`memory.jsonl` 完整，LLM 不可用时全链路 fallback 也能跑完
+- [ ] 单元测试总数 ≥ 85
 
-### Week 8 验证
-- [ ] `import optuna` 无报错
-- [ ] F-LLM-2 裁剪后搜索空间变小
-- [ ] OptunaController 有 ≥10 条 trial 记录
-- [ ] 4 组对比实验均成功完成，各有完整数据
-- [ ] 消融实验展示了各功能的性能贡献
-- [ ] `comparison_summary.json` 数据自洽且可用于论文
+### Week 8 验证（对比实验 + 最终报告）
+- [ ] Reporter 段落 ≥ 300 字，脚本 diff 确认毕 Reporter 结果中的数字都能在 `memory.jsonl` 找到
+- [ ] `run_tuning.sh` 对 3 种 workload 各跑一次，每记墙钟 ≤ 60 min，共产出 3 份 report
+- [ ] 3 workload 中 ≥ 2/3 达到 ≥ 10% 吞吐提升，3/3 不违反 SLO
+- [ ] 5 组消融 A/B/C 的 best_score < full版；E 的 wall_time > full版 × 1.3
+- [ ] 3 张核心图（throughput_improvement_bar / agent_trajectory / ablation_bar）生成
+- [ ] `docs/final_report.md` 定稿；每个数字能从 `results/tuning/` 反查到

@@ -23,6 +23,13 @@ MAX_MODEL_LEN=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c
 DTYPE=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['model']['dtype'])")
 TRUST_REMOTE=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print('--trust-remote-code' if c['model'].get('trust_remote_code') else '')")
 
+# ENFORCE_EAGER=1 透传 --enforce-eager（Week 6 VllmLauncher 用，可绕过 CUDA graph 加速热重启）
+EAGER_FLAG=""
+if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
+    EAGER_FLAG="--enforce-eager"
+    echo "[INFO] ENFORCE_EAGER=1 → 追加 --enforce-eager"
+fi
+
 # ---------- 本地模型优先：本地有则用本地，没有则在线下载 ----------
 if [[ "${MODEL}" == */* ]]; then
     LOCAL_NAME=$(basename "${MODEL}")
@@ -56,6 +63,7 @@ nohup python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len "${MAX_MODEL_LEN}" \
     --dtype "${DTYPE}" \
     ${TRUST_REMOTE} \
+    ${EAGER_FLAG} \
     > "${LOG_FILE}" 2>&1 &
 disown
 

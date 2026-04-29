@@ -1,507 +1,346 @@
-### Task 7.4: BaseController + FixedController
-
-**目标**：定义 Controller 抽象接口和最简单的对照实现。
-
-**操作**：
-1. 新建 `controllers/` 目录
-2. 新建 `controllers/__init__.py`
-3. 新建 `controllers/base.py`：
-
-```python
-"""
-BaseController — Controller 抽象基类
-
-所有 controller 必须实现 decide() 方法，返回统一格式的决策。
-"""
-from abc import ABC, abstractmethod
-
-
-class BaseController(ABC):
-    @abstractmethod
-    async def decide(self, analyzer_state: dict) -> dict:
-        """
-        输入: Analyzer 输出的完整状态
-        输出:
-        {
-            "controller_type": str,
-            "policy_mode": "conservative" | "balanced" | "aggressive" | "fixed",
-            "action_type": "fast_only" | "slow_only" | "both" | "none",
-            "fast_action": {"batching_window_ms": int, "max_concurrency": int, "admission_threshold": float} | null,
-            "slow_action": {"target_profile": str} | null,
-            "reasoning": str,
-            "confidence": float,
-            "llm_source": str | null,
-            "decision_timestamp": float
-        }
-        """
-        pass
-```
-
-4. 新建 `controllers/fixed_controller.py`：
-
-```python
-class FixedController(BaseController):
-    """固定配置 controller，作为实验对照基线"""
-
-    def __init__(self, config: dict):
-        """config 包含固定的 fast_action 参数"""
-
-    async def decide(self, analyzer_state: dict) -> dict:
-        """始终返回初始配置，不变"""
-```
-
-5. 定义 `controller_decisions.jsonl` 日志格式：
-
-```json
-{
-  "timestamp": 1234567890.123,
-  "decision_cycle": 1,
-  "controller_type": "llm_strategy",
-  "analyzer_state_summary": {"load_level": "high", "bottleneck_type": "decode", "risk_level": "warning"},
-  "decision": {"policy_mode": "conservative", "action_type": "fast_only", "fast_action": {...}},
-  "execution_result": {"success": true, "path": "fast", "duration_ms": 15},
-  "llm_stats": {"latency_ms": 1200, "source": "deepseek"}
-}
-```
-
-6. 新建 `configs/controllers/controller_fixed.json`:
-```json
-{
-  "controller": {
-    "type": "fixed",
-    "params": {
-      "batching_window_ms": 0,
-      "max_concurrency": 32,
-      "admission_threshold": 1.0
-    }
-  }
-}
-```
-
-**产出物**：4 个新文件 + 1 个配置文件
-
----
-
-### Task 7.5: Safety Guard (Layer 0)
-
-**目标**：实现硬编码规则安全层，优先级最高，不经 LLM。
-
-**操作**：
-1. 新建 `controllers/safety_guard.py`：
-
-```python
-"""
-SafetyGuard — Layer 0 安全规则检查器
-
-最高优先级，所有 controller 的决策都必须经过 Safety Guard 校验。
-使用硬编码规则，不调用 LLM，确保确定性和低延迟。
-"""
-
-class SafetyGuard:
-    def __init__(self, config: dict = None):
-        """
-        config 可覆盖默认阈值:
-        {
-            "slo_ttft_p95_ms": 200,
-            "slo_latency_p95_ms": 5000,
-            "critical_reject_rate": 0.5,
-            "critical_kv_cache_pct": 95,
-            "rollback_after_consecutive_violations": 2
-        }
-        """
-
-    def check_emergency(self, analyzer_state: dict) -> dict | None:
-        """
-        检查是否需要紧急干预。
-        如果不需要返回 None；
-        如果需要返回紧急动作:
-        {
-            "action_type": "fast_only" | "both",
-            "fast_action": {"max_concurrency": 4, "admission_threshold": 0.7, ...},
-            "slow_action": {"target_profile": "L"} | null,
-            "reasoning": "reject_rate 超过 50%，紧急降低并发",
-            "is_emergency": True
-        }
-        """
-        # 规则 1: reject_rate > 50% → 立即降并发到最小，收紧准入
-        # 规则 2: TTFT_p95 > SLO × 2.5 (500ms) → 紧急降并发
-        # 规则 3: KV cache > 95% → 切换到 Profile L（最小 context）
-        # 规则 4: 连续 2 个周期 SLO 违规 → 触发 rollback
-
-    def validate_decision(self, decision: dict, analyzer_state: dict) -> dict:
-        """
-        校验 controller 决策是否安全。
-        修正不安全的决策（如 risk=critical 时禁止 aggressive）。
-        返回修正后的 decision。
-        """
-```
-
-**产出物**：`controllers/safety_guard.py`
-
----
-
-### Task 7.6: LLM Strategy Controller (Layer 1)
-
-**目标**：实现以 LLM 为核心的策略决策器。
-
-**操作**：
-1. 新建 `controllers/llm_strategy_controller.py`：
-
-```python
-"""
-LlmStrategyController — Layer 1 LLM 策略控制器
-
-核心调用: F-LLM-1（策略选择 + 动作决策）
-每个决策周期 (30s) 调用一次 LLM。
-"""
-
-class LlmStrategyController(BaseController):
-    def __init__(self, llm_advisor: 'LlmAdvisor',
-                 action_space: dict,
-                 config: dict = None):
-        """
-        action_space: 可用的快慢动作空间
-        config: {
-            "decision_interval_s": 30,
-            "history_window": 5,
-            "current_fast_config": {...},
-            "current_profile": "B"
-        }
-        """
-
-    async def decide(self, analyzer_state: dict) -> dict:
-        """
-        1. 将 analyzer_state + current_config + history 组装为 F-LLM-1 输入
-        2. 调用 llm_advisor.select_strategy()
-        3. 解析 LLM 输出
-        4. 记录到决策历史
-        5. 返回统一格式的 decision
-        """
-
-    def update_config(self, new_config: dict):
-        """更新当前配置（Executor 执行后回调）"""
-
-    def record_outcome(self, decision: dict, execution_result: dict, post_metrics: dict):
-        """记录决策结果用于历史参考"""
-
-    def get_decision_history(self, n: int = 5) -> list[dict]:
-        """返回最近 n 次决策及结果"""
-```
-
-2. 新建 `configs/controllers/controller_llm.json`:
-```json
-{
-  "controller": {
-    "type": "llm_strategy",
-    "decision_interval_s": 30,
-    "history_window": 5,
-    "action_space": {
-      "fast": {
-        "batching_window_ms": [0, 10, 20, 50],
-        "max_concurrency": [4, 8, 16, 32],
-        "admission_threshold": [0.7, 0.8, 0.9, 1.0]
-      },
-      "slow": {
-        "backend_profile": ["L", "B", "T"]
-      }
-    }
-  }
-}
-```
-
-**产出物**：`controllers/llm_strategy_controller.py` + `configs/controllers/controller_llm.json`
-
----
-
-### Task 7.7: 闭环集成 + 稳定性测试
-
-**目标**：把所有模块串成完整闭环并验证稳定性。
-
-**操作**：
-1. 修改 `proxy/proxy_server.py`，新增 `--controller` 参数：
-   - 加载 controller 配置
-   - 后台启动决策循环 (`asyncio.create_task`)：
-     ```
-     每 decision_interval_s 秒:
-       1. 从 monitor 获取最新指标
-       2. 注入 analyzer
-       3. 调用 analyzer.get_full_state(llm_advisor) → state
-       4. safety_guard.check_emergency(state) → emergency?
-       5. 如果 emergency: 直接执行 emergency action
-       6. 否则: controller.decide(state) → decision
-       7. safety_guard.validate_decision(decision, state) → validated
-       8. executor.check_cooldown / check_dwell_time
-       9. executor.execute(validated)
-       10. controller.record_outcome(...)
-       11. 写入 controller_decisions.jsonl
-     ```
-   - 决策循环必须 catch all exceptions，确保单次失败不崩溃
-
-2. 新建 `scripts/experiment/run_closed_loop.sh`：
-```bash
-#!/bin/bash
-# 用法: bash scripts/experiment/run_closed_loop.sh <controller_config> <workload_config>
-# 1. 启动 vLLM（默认 Profile B）
-# 2. 启动 proxy（带 --controller 参数）
-# 3. 启动 WorkloadGenerator 压测（指向 proxy port 9000）
-# 4. 收集所有结果
-# 5. 停止 proxy
-```
-
-3. 在 `results/<experiment_id>/` 中额外输出：
-   - `controller_decisions.jsonl`: 每次决策的完整记录
-
-4. **稳定性测试**：运行以下 4 个场景，每个 5 分钟：
-   - `workload_baseline.json` (burst 混合)
-   - `workload_rate4.json` (constant rate 4 req/s)
-   - `workload_long_only.json` (全长请求)
-   - `workload_phase_switch.json` (中途切换负载)
-5. 验证标准：
-   - 无崩溃
-   - `controller_decisions.jsonl` 有 ≥5 条非 `none` 决策
-   - SafetyGuard 在 inject 高压时正确触发（如果出现高压场景）
-   - LLM 调用成功率 > 80%
-
-**产出物**：`proxy/proxy_server.py` 更新、`scripts/experiment/run_closed_loop.sh`
-
-**验证**：4 个场景各运行 5 分钟，产出完整数据，无崩溃
-
----
-
-## 十、Week 8 — Optuna Controller + 对比实验
-
-### Task 8.1: 添加 Optuna 依赖 + 离散搜索空间
-
-**目标**：在 requirements.txt 中加入 Optuna 并定义离散搜索空间。
-
-**操作**：
-1. 在 `requirements.txt` 中添加 `optuna>=3.6.0` 和 `openai>=1.0.0`（如尚未添加）
-2. 在 WSL2 中安装：`pip install optuna openai`
-3. 定义搜索空间配置 `configs/controllers/controller_optuna.json`：
-
-```json
-{
-  "controller": {
-    "type": "optuna",
-    "study_name": "vllm_proxy_optimization",
-    "sampler": "tpe",
-    "trial_duration_s": 60,
-    "max_trials": 50,
-    "llm_pruning_enabled": true,
-    "action_space": {
-      "batching_window_ms": [0, 10, 20, 50],
-      "max_concurrency": [4, 8, 16, 32],
-      "admission_threshold": [0.7, 0.8, 0.9, 1.0],
-      "backend_profile": ["L", "B", "T"]
-    },
-    "reward": {
-      "alpha": 0.4,
-      "beta": 0.4,
-      "gamma": 0.2,
-      "slo_ttft_p95_ms": 200,
-      "slo_latency_p95_ms": 5000
-    }
-  }
-}
-```
-
-**产出物**：`requirements.txt` 更新 + `configs/controllers/controller_optuna.json`
-
-**验证**：`python3 -c "import optuna; print(optuna.__version__)"` 无报错
-
----
-
-### Task 8.2: LLM 搜索空间裁剪 (F-LLM-2)
-
-**目标**：在每个 Optuna trial 前用 LLM 缩小候选范围。
-
-**操作**：
-1. 确保 `llm_advisor/llm_advisor.py` 的 `prune_search_space()` 方法已实现（Task 6.1 中定义）
-2. 实现裁剪逻辑：
-   - 调用 F-LLM-2 prompt 模板
-   - LLM 返回 `constrained_space`（每个参数的受限候选集）和 `fixed_params`（直接固定的参数）
-   - 裁剪后的空间传给 Optuna study 的 suggest 方法
-3. 降级：LLM 不可用时使用完整搜索空间
-
-**产出物**：`llm_advisor/llm_advisor.py` 的 `prune_search_space()` 完善
-
-**验证**：
-```bash
-python3 -c "
-import asyncio, json, os
-from llm_advisor.llm_advisor import LlmAdvisor
-
-config = json.load(open('configs/llm_advisor/llm_advisor_config.json'))['llm_advisor']
-config['api_key'] = os.environ.get('DEEPSEEK_API_KEY', '')
-advisor = LlmAdvisor(config)
-
-state = {'bottleneck_type': 'decode', 'dominant_pattern': 'long_decode', 'risk_level': 'warning'}
-space = {'batching_window_ms': [0,10,20,50], 'max_concurrency': [4,8,16,32], 'admission_threshold': [0.7,0.8,0.9,1.0], 'backend_profile': ['L','B','T']}
-result = asyncio.run(advisor.prune_search_space(state, space, []))
-print('Constrained space:', result.get('constrained_space'))
-print('Fixed params:', result.get('fixed_params'))
-"
-```
-
----
-
-### Task 8.3: OptunaController
-
-**目标**：实现 Optuna ask-and-tell 控制器。
-
-**操作**：
-1. 新建 `controllers/optuna_controller.py`：
-
-```python
-"""
-OptunaController — Layer 2 贝叶斯优化控制器
-
-使用 Optuna ask-and-tell 接口进行在线配置搜索。
-每个 trial = 一个控制窗口（60s），运行该配置后观测 reward。
-LLM (F-LLM-2) 在每个 trial 前裁剪搜索空间。
-"""
-import optuna
-
-
-class OptunaController(BaseController):
-    def __init__(self, llm_advisor: 'LlmAdvisor',
-                 safety_guard: 'SafetyGuard',
-                 config: dict):
-        """
-        创建 Optuna study (TPESampler)
-        """
-
-    async def decide(self, analyzer_state: dict) -> dict:
-        """
-        1. 如果当前 trial 还在运行中（未到 trial_duration_s）→ 返回 none
-        2. 如果当前 trial 已结束:
-           a. 计算 reward
-           b. tell(trial, reward)
-           c. 记录 trial 结果
-        3. 开始新 trial:
-           a. 调用 LLM 裁剪搜索空间 (F-LLM-2)
-           b. study.ask() 在裁剪后的空间中采样
-           c. 转换为 fast_action + slow_action
-           d. 返回 decision
-        """
-
-    def _compute_reward(self, trial_metrics: dict) -> float:
-        """
-        R = alpha * throughput_norm - beta * slo_violation_rate - gamma * reject_rate
-
-        throughput_norm: 归一化到 [0, 1]，以 baseline 0 的 75 tps 为基准
-        slo_violation_rate: SLO 违规请求比例
-        reject_rate: 被拒绝请求比例
-        """
-
-    def get_trial_history(self) -> list[dict]:
-        """返回所有 trial 的参数和 reward"""
-
-    def get_best_params(self) -> dict:
-        """返回当前最优配置"""
-```
-
-**产出物**：`controllers/optuna_controller.py`
-
-**验证**：
-```bash
-# 在闭环中运行 10 分钟（~10 个 trial）
-bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_optuna.json configs/workloads/workload_baseline.json
-# 检查 trial 历史
-python3 -c "
-import json
-with open('results/<最新实验ID>/controller_decisions.jsonl') as f:
-    trials = [json.loads(l) for l in f if 'trial' in json.loads(l).get('decision',{}).get('reasoning','')]
-print(f'{len(trials)} trials recorded')
-"
-```
-
----
-
-### Task 8.4: 4 组对比实验
-
-**目标**：在相同 workload 下对比 4 种 controller 的性能。
-
-**操作**：
-1. 新建 `scripts/experiment/run_comparison.sh`：
-
-```bash
-#!/bin/bash
-# 4 组对比实验，同一 workload 下:
-#
-# Group A: 直连 vLLM（无 proxy）
-#   python3 benchmarks/run_benchmark.py --port 8000 --workload configs/workloads/workload_baseline.json
-#
-# Group B: proxy + FixedController（对照基线）
-#   bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_fixed.json configs/workloads/workload_baseline.json
-#
-# Group C: proxy + LlmStrategyController（规则+LLM）
-#   bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_llm.json configs/workloads/workload_baseline.json
-#
-# Group D: proxy + OptunaController（LLM+BO）
-#   bash scripts/experiment/run_closed_loop.sh configs/controllers/controller_optuna.json configs/workloads/workload_baseline.json
-#
-# 每组运行 10 分钟，固定 workload seed=42
-# 输出到 results/comparison_<timestamp>/
-```
-
-2. 每组实验使用相同的 workload 配置和随机种子
-3. 建议使用 `workload_phase_switch.json`（包含负载切换）以展示 controller 的适应能力
-4. 汇总 4 组的 summary.json 到一个对比表
-
-**产出物**：`scripts/experiment/run_comparison.sh`
-
-**验证**：4 组实验均成功完成，`results/comparison_*/` 下各有完整数据
-
----
-
-### Task 8.5: 消融实验 + 结果汇总
-
-**目标**：通过消融实验验证各功能的贡献，生成论文所需数据。
-
-**操作**：
-1. **消融实验**（关闭单个功能观察退化）：
-   - Ablation 1: 关闭 batching window（固定 0ms）
-   - Ablation 2: 关闭 concurrency 控制（固定 32）
-   - Ablation 3: 关闭 admission control（固定 1.0）
-   - Ablation 4: 关闭 LLM（纯规则 controller）
-   - Ablation 5: 关闭 Optuna（纯 LLM controller）
-
-2. 新建 `scripts/experiment/run_ablation.sh`：
-```bash
-#!/bin/bash
-# 对每个消融组运行 5 分钟，记录性能退化
-```
-
-3. **结果汇总**：
-   - 新建 `results/comparison_summary.json`，包含所有组的对比数据
-   - 格式：
-   ```json
-   {
-     "experiment_date": "2026-05-XX",
-     "workload": "workload_phase_switch.json",
-     "groups": {
-       "direct": {"throughput_tps": ..., "ttft_p95_ms": ..., "latency_p95_ms": ..., "reject_rate": ...},
-       "fixed": {...},
-       "llm_strategy": {...},
-       "optuna": {...}
-     },
-     "ablation": {
-       "no_batching": {...},
-       "no_concurrency_control": {...},
-       "no_admission": {...},
-       "no_llm": {...},
-       "no_optuna": {...}
-     }
-   }
-   ```
-
-4. 为论文准备的关键数据点：
-   - 4 组 controller 的吞吐量/延迟/SLO 违规率对比
-   - Optuna 收敛曲线（trial_id vs reward）
-   - Controller 决策轨迹（时序图数据）
-   - 消融实验退化程度
-
-**产出物**：`scripts/experiment/run_ablation.sh` + `results/comparison_summary.json`
-
-**验证**：所有组实验完整，对比表数据自洽
+现在的问题已经从“在线控制”变成了“固定数据集、允许重启、追求性能提升”。在这个设定下，最合适的不是复杂 RL，而是一个可重启的自动调参 agent：它负责生成候选配置、启动 vLLM、跑统一基准、读取指标、更新搜索策略，最后输出最优参数组合。vLLM 官方也明确说明，engine arguments 是 LLM(...) 或 vllm serve 的配置参数；同时官方提供了 vllm bench latency / serve / throughput 这套基准工具，正好适合这种“重启—测试—比较”的调参闭环。
+
+我会建议你把整个系统定义成：
+
+VTA-Agent（vLLM Tuning Agent）
+一个面向固定 workload 的、可解释的、分阶段搜索的 vLLM 自动调参 agent。
+
+一、先定一个正确的目标
+
+你这个项目里，agent 不应该直接优化“某一个单独指标”，而应该优化一个约束下的综合目标。
+
+更稳的定义是：
+
+主目标：吞吐提升至少 10%
+约束：P95 latency、TTFT、TPOT/ITL 不能明显恶化，且不能频繁 preemption
+
+这是因为 vLLM 的几个核心参数天然存在权衡：
+max_num_batched_tokens 较小的时候，ITL 通常更好；较大时，TTFT 和吞吐往往更好，官方还特别建议在较小模型和大 GPU 上，为了吞吐可把它设到 8192 以上。另一方面，KV cache 空间不够时会发生 preemption，而 preemption/recomputation 会伤害端到端延迟；官方建议这时提高 gpu_memory_utilization，或者减小 max_num_seqs / max_num_batched_tokens。
+
+所以你的 agent 最终优化的可以是：
+
+Score=Throughput−λ
+1
+	​
+
+⋅P95−λ
+2
+	​
+
+⋅TTFT−λ
+3
+	​
+
+⋅PreemptionPenalty
+
+或者更简单一点，先做“约束过滤 + 主目标排序”：
+
+先淘汰不满足 P95 / TTFT / preemption 约束的配置
+再从剩下配置里选 throughput 最高的
+
+这个做法最适合本科毕设，因为简单、稳、好解释。
+
+二、这个 agent 的最佳形态
+
+你现在最适合的不是“在线 agent”，而是离线工作流 agent。
+
+组件设计
+
+1. Workload Profiler
+先扫描固定数据集，提取 workload 指纹：
+
+prompt 长度分布
+目标输出长度分布
+是否大量共享前缀
+请求到达模式，固定速率还是 burst
+模型大小、GPU 数量、显存大小
+
+2. Search Planner
+根据 workload 类型，自动决定先搜哪些参数，后搜哪些参数。
+
+3. Config Generator
+生成候选 vLLM 配置。
+
+4. Executor / Restarter
+按配置启动 vllm serve 或 LLM(...)。
+
+5. Benchmark Runner
+统一调用 vllm bench serve 或 vllm bench throughput 测试。官方这两个工具就是分别做在线 serving throughput 和离线 throughput 基准的。
+
+6. Metrics Parser
+读取吞吐、TTFT、TPOT/ITL、P95/P99、preemption、KV cache 相关指标。vLLM 的 metrics 文档明确说明会记录每轮新生成 token、完成 prefill 的 prompt token、queue interval、TTFT、TPOT 等统计，还支持 KV cache residency metrics。
+
+7. Optimizer
+先粗搜，再精调。
+不建议一开始就上强化学习，最合适的是：
+
+第一阶段：规则筛选 + 粗网格搜索
+第二阶段：Bayesian Optimization 或树模型代理搜索
+第三阶段：局部精调
+
+8. Report Generator
+输出最优配置、对 baseline 的提升比例、以及“为什么它赢”。
+
+三、最重要的参数分组
+
+你不要一上来搜十几个参数。最稳的是分成三层。
+
+第一层：必须优先调的 5 个核心参数
+
+1. max_num_batched_tokens
+每个 iteration 最多处理多少 token。官方说明它是最关键的吞吐/延迟旋钮之一：小值更利于 ITL，大值更利于 TTFT 和吞吐，且吞吐场景下常建议大于 8192。
+
+2. max_num_seqs
+每个 iteration 最多处理多少条 sequence。这个值过大容易加剧 KV cache 压力；官方建议 preemption 多时可以减小它。
+
+3. gpu_memory_utilization
+vLLM 为执行器/KV cache 预留的显存比例，默认 0.9；提高它能给 KV cache 更多空间。
+
+4. max_model_len
+prompt + output 的上下文长度上限；可以设为 auto，也可以按你的 workload 裁剪。对固定数据集来说，这个值如果设得过大，会白白吃掉可用于 KV cache 的空间。官方说明它支持自动选择能装进 GPU 的最大长度。
+
+5. enable_prefix_caching
+如果数据集里共享前缀很多，它很值得开；但它只减少 prefill 时间，不减少 decode 时间，因此对长输出、低共享前缀场景收益不大。
+
+第二层：和长 prompt/混合负载强相关的参数
+
+6. enable_chunked_prefill
+在 V1 中，chunked prefill 在可能时默认启用；它会把大 prefill 切块，并和 decode 一起调度，有助于平衡 throughput 和 latency。
+
+7. max_num_partial_prefills
+chunked prefill 时，最多允许多少条序列被部分 prefill。
+
+8. max_long_partial_prefills
+控制长 prompt 并发部分 prefill 的数量；官方明确说把它设得低于 max_num_partial_prefills，可能让短 prompt 在某些情况下插队，从而改善 latency。
+
+9. long_prefill_token_threshold
+超过这个长度的 prompt 被视为 long prompt。
+
+这三个参数对“短请求 + 长请求混合”的数据集尤其重要。
+
+第三层：多 GPU 或更高阶的参数
+
+如果你有多 GPU，再考虑：
+
+10. tensor_parallel_size
+增大它可以让每张 GPU 为 KV cache 留出更多空间，但会引入同步开销。
+
+11. pipeline_parallel_size
+也能减轻单卡权重压力、间接腾出 KV cache 空间，但可能增加 latency。
+
+12. data_parallel_size
+官方说明它适合“扩 throughput”而不是“扩单模型尺寸”，如果你 GPU 足够多、又是在线 serving 测试，可以把它列为扩展项。
+
+四、最合理的 agent 工作流
+
+我建议你做成 3 阶段搜索。
+
+阶段 A：Workload 诊断
+
+先别调参，先做 workload fingerprint。
+
+agent 先跑一次 baseline，采集：
+
+平均输入长度、P90 输入长度
+平均输出长度、P90 输出长度
+TTFT、TPOT、P95/P99
+preemption 次数
+prefix 重复率
+
+然后把 workload 分成三类：
+
+A 类：prefill-heavy
+输入长、输出短、共享前缀高
+→ 优先考虑 enable_prefix_caching、max_num_batched_tokens、chunked prefill 相关参数
+
+B 类：decode-heavy
+输入短、输出长
+→ 少依赖 prefix caching，更关注 max_num_seqs、max_num_batched_tokens 和 preemption
+
+C 类：mixed
+长短 prompt 混合
+→ 重点调 max_num_partial_prefills、max_long_partial_prefills、long_prefill_token_threshold
+
+阶段 B：粗搜索
+
+先搜小空间，快速淘汰烂配置。
+
+推荐你先用下面这个搜索空间：
+
+max_num_batched_tokens: {2048, 4096, 8192, 16384}
+max_num_seqs: {16, 32, 64, 128}
+gpu_memory_utilization: {0.85, 0.90, 0.93, 0.95}
+enable_prefix_caching: {on, off}
+max_model_len: {auto, p99(prompt+output), p95(prompt+output)}
+
+如果是 mixed workload，再加：
+
+max_num_partial_prefills: {1, 2, 4}
+max_long_partial_prefills: {1, 2}
+long_prefill_token_threshold: {p75_prompt, p90_prompt}
+
+这里不要全排列暴力搜，不然组合太大。
+你可以让 agent 用一个简单的分层规则先缩小空间：
+
+如果 prefix 重复率低，直接把 enable_prefix_caching=off 的权重提高
+如果 preemption 多，优先减小 max_num_seqs 或 max_num_batched_tokens，或者提高 gpu_memory_utilization，因为官方就这么建议
+如果 TTFT 差但 ITL 还行，优先提高 max_num_batched_tokens
+如果 ITL 差但 TTFT 还行，优先降低 max_num_batched_tokens
+阶段 C：精搜索
+
+从粗搜索里取 Top-5 配置，围绕它们再细调。
+
+这时候再上：
+
+Bayesian Optimization
+TPE
+或简单的局部邻域搜索
+
+例如当前最好配置是：
+
+max_num_batched_tokens=8192
+max_num_seqs=64
+gpu_memory_utilization=0.93
+
+那精调阶段就只在邻域里试：
+
+max_num_batched_tokens: 6144 / 8192 / 12288
+max_num_seqs: 48 / 64 / 80
+gpu_memory_utilization: 0.91 / 0.93 / 0.95
+
+这样效率很高，也很符合“agent 在学习参数结构”的叙事。
+
+五、这个 agent 要怎么“利用好参数特性”
+
+你不能把所有参数当黑盒。要让 agent 带一点参数先验知识。
+
+规则 1
+
+如果 preemption 高频，优先：
+
+提高 gpu_memory_utilization
+降低 max_num_seqs
+降低 max_num_batched_tokens
+这是官方明确建议的方向。
+规则 2
+
+如果 TTFT 偏高，优先：
+
+增大 max_num_batched_tokens
+打开 prefix caching（前提是共享前缀高）
+对 mixed workload，适当提高 partial prefill 并发
+因为大 token budget 更利于 prefill 处理，prefix caching 也只主要帮 prefill。
+规则 3
+
+如果 ITL/TPOT 偏高，优先：
+
+降低 max_num_batched_tokens
+降低过多的长 prefill 并发
+控制 long prompt 对 decode 的干扰
+因为较小的 max_num_batched_tokens 会减少拖慢 decode 的 prefills。
+规则 4
+
+如果 吞吐不高但系统很稳，优先：
+
+适度提高 max_num_seqs
+适度提高 max_num_batched_tokens
+多 GPU 时考虑 TP/DP
+因为这通常说明你还没把机器吃满。
+规则 5
+
+如果 数据集共享前缀高，优先试 enable_prefix_caching=on；
+如果是长输出、低共享前缀，就别太指望它。
+
+六、实验上最容易踩坑的地方
+1. 不要把“热缓存收益”误当成“参数收益”
+
+因为你是同一个数据集反复跑，prefix cache 很容易让后面的实验天然变快。
+vLLM 内部就提供了 reset prefix cache 的能力，文档明确提到它可用于 benchmarking 时重置 prefix caching 状态。
+
+所以你要规定两种评测：
+
+cold-run：每次重启或清 cache 后测
+warm-run：缓存稳定后测
+
+最后至少报告：
+
+冷启动最优配置
+热缓存最优配置
+2. 固定请求顺序和 request-rate
+
+因为 vllm bench serve 支持设置 dataset、request-rate、num-prompts；固定它们，实验才公平。
+
+3. 先 warmup，再正式计时
+
+否则第一次图编译、内核 warmup 会污染结果。
+
+4. 不要一次调太多参数
+
+第一版把搜索空间压在 5～8 个核心参数以内，否则很难收敛。
+
+七、我建议你的最终 agent 结构
+
+你可以直接按这个做：
+
+模块 1：Profiler
+
+输入数据集，输出 workload fingerprint。
+
+模块 2：Heuristic Planner
+
+根据 fingerprint 决定：
+
+搜哪些参数
+哪些参数固定
+每个参数的初始候选范围
+模块 3：Config Proposer
+
+生成下一组参数。
+先规则生成，再 BO 精调。
+
+模块 4：Runner
+
+执行：
+
+写入 vLLM 启动参数
+重启服务
+warmup
+跑 vllm bench serve / throughput
+拉取 metrics
+存档结果
+模块 5：Judge
+
+判断：
+
+是否满足约束
+是否 early stop
+是否进入局部精调
+模块 6：Explainer
+
+最后生成：
+
+最优配置
+相比 baseline 提升多少
+为什么提升
+不同参数对不同指标的影响
+八、最适合你的第一版可实现方案
+
+如果你想要一个真能做出来的版本，我建议先只调这 6 个：
+
+max_num_batched_tokens
+max_num_seqs
+gpu_memory_utilization
+max_model_len
+enable_prefix_caching
+max_num_partial_prefills（仅 mixed workload 时启用）
+
+然后工作流就设成：
+
+baseline 跑一遍
+粗搜索 20～30 组
+选 Top-5
+邻域精调 10～15 组
+输出最优配置
+报告 cold/warm 两套结果
+
+这已经足够写成一个完整本科毕设，而且10% 提升是有机会做到的。我不能保证任何模型和任何机器都一定有 10%+，但在“固定 workload、baseline 不是手工最优”的前提下，这个目标是现实的。

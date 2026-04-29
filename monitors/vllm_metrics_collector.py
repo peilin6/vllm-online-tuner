@@ -38,6 +38,10 @@ _METRIC_PATTERNS = {
     "num_preemptions_total": re.compile(
         r'^vllm:num_preemptions_total\b.*?\s+([\d.]+)', re.MULTILINE
     ),
+    # Task 6.2: 队列等待总时间（counter，单位 s）
+    "queue_time_seconds_sum": re.compile(
+        r'^vllm:time_in_queue_requests_seconds_sum\b.*?\s+([\d.eE+\-]+)', re.MULTILINE
+    ),
 }
 
 
@@ -130,6 +134,7 @@ class VllmMetricsCollector:
                 "gpu_cache_usage_pct": -1.0,
                 "cpu_cache_usage_pct": -1.0,
                 "num_preemptions_total": -1,
+                "queue_time_seconds_sum": -1.0,
                 "error": str(e),
             }
         except Exception as e:

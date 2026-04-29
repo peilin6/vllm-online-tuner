@@ -269,8 +269,14 @@ async def run_benchmark_workload(
 
 # ========== 统计汇总 ==========
 
-def compute_stats(results: list[dict], wall_time_s: float = 0) -> dict:
-    """计算汇总统计指标"""
+def compute_stats(results: list[dict], wall_time_s: float = 0,
+                  vllm_samples: list[dict] | None = None) -> dict:
+    """计算汇总统计指标。
+
+    Task 6.2: 新增 vllm_samples 参数，用于聚合 vLLM /metrics 时序为 trial-level
+    标量字段（preemptions_total / preemption_rate_per_min / kv_cache_usage_p95_pct /
+    queue_time_delta_s / vllm_metrics_available）。
+    """
     successes = [r for r in results if r["success"]]
     failures = [r for r in results if not r["success"]]
 
@@ -340,7 +346,59 @@ def compute_stats(results: list[dict], wall_time_s: float = 0) -> dict:
             error_counts[err] = error_counts.get(err, 0) + 1
         stats["errors"] = error_counts
 
+    # Task 6.2: vLLM 时序 → trial-level 聚合
+    stats["vllm_aggregates"] = _aggregate_vllm_samples(vllm_samples or [], total_time_s)
+
     return stats
+
+
+def _aggregate_vllm_samples(samples: list[dict], wall_time_s: float) -> dict:
+    """把 VllmMetricsCollector 的时序样本聚合成 5 个调参关键字段。
+
+    返回字段:
+    - vllm_metrics_available: bool — 至少一条 source=='vllm' 才为 True
+    - preemptions_total: int — counter 差分（max - min）
+    - preemption_rate_per_min: float
+    - kv_cache_usage_p95_pct: float — gpu_cache_usage_pct 的 P95 (∈ [0, 1])
+    - queue_time_delta_s: float — counter 差分
+    """
+    out = {
+        "vllm_metrics_available": False,
+        "preemptions_total": 0,
+        "preemption_rate_per_min": 0.0,
+        "kv_cache_usage_p95_pct": -1.0,
+        "queue_time_delta_s": -1.0,
+    }
+    valid = [s for s in samples if s.get("source") == "vllm"]
+    if not valid:
+        return out
+    out["vllm_metrics_available"] = True
+
+    preempts = [s["num_preemptions_total"] for s in valid
+                if isinstance(s.get("num_preemptions_total"), (int, float))
+                and s["num_preemptions_total"] >= 0]
+    if preempts:
+        out["preemptions_total"] = int(max(preempts) - min(preempts))
+        if wall_time_s > 0:
+            out["preemption_rate_per_min"] = round(
+                out["preemptions_total"] / wall_time_s * 60.0, 3
+            )
+
+    kv_vals = [s["gpu_cache_usage_pct"] for s in valid
+               if isinstance(s.get("gpu_cache_usage_pct"), (int, float))
+               and s["gpu_cache_usage_pct"] >= 0]
+    if kv_vals:
+        sorted_kv = sorted(kv_vals)
+        idx = min(len(sorted_kv) - 1, int(len(sorted_kv) * 0.95))
+        out["kv_cache_usage_p95_pct"] = round(sorted_kv[idx], 4)
+
+    qts = [s["queue_time_seconds_sum"] for s in valid
+           if isinstance(s.get("queue_time_seconds_sum"), (int, float))
+           and s["queue_time_seconds_sum"] >= 0]
+    if qts:
+        out["queue_time_delta_s"] = round(max(qts) - min(qts), 3)
+
+    return out
 
 
 def format_summary(stats: dict, config_info: dict) -> str:
@@ -407,6 +465,19 @@ def format_summary(stats: dict, config_info: dict) -> str:
         lines += ["", "  错误分布:"]
         for err, cnt in stats["errors"].items():
             lines.append(f"    {err}: {cnt}")
+
+    # Task 6.2: vLLM 内部指标聚合
+    va = stats.get("vllm_aggregates")
+    if va and va.get("vllm_metrics_available"):
+        lines += [
+            "",
+            "  vLLM 内部指标:",
+            f"    抢占总数 / 速率: {va['preemptions_total']} ({va['preemption_rate_per_min']:.2f} /min)",
+            f"    KV 缓存使用 P95: {va['kv_cache_usage_p95_pct'] * 100:.1f}%"
+            if va["kv_cache_usage_p95_pct"] >= 0 else "    KV 缓存使用 P95: N/A",
+            f"    队列等待累计:    {va['queue_time_delta_s']:.2f} s"
+            if va["queue_time_delta_s"] >= 0 else "    队列等待累计:    N/A",
+        ]
 
     lines.append("=" * 60)
     return "\n".join(lines)
@@ -559,7 +630,7 @@ def main():
         # 过滤掉 warmup 和 cooldown 请求，用于统计
         stats_results = [r for r in results
                          if not r.get("is_warmup") and not r.get("is_cooldown")]
-        stats = compute_stats(stats_results, wall_time_s=wall_time)
+        stats = compute_stats(stats_results, wall_time_s=wall_time, vllm_samples=vllm_samples)
         stats["wall_time_s"] = wall_time
         stats["warmup_excluded"] = sum(1 for r in results if r.get("is_warmup"))
         stats["cooldown_excluded"] = sum(1 for r in results if r.get("is_cooldown"))
@@ -621,7 +692,7 @@ def main():
         gpu_samples = gpu_monitor.stop() if gpu_monitor else []
         vllm_samples = vllm_collector.stop() if vllm_collector else []
 
-        stats = compute_stats(results, wall_time_s=wall_time)
+        stats = compute_stats(results, wall_time_s=wall_time, vllm_samples=vllm_samples)
         stats["wall_time_s"] = wall_time
         stats["gpu_samples_count"] = len(gpu_samples)
         stats["vllm_metrics_samples_count"] = len(vllm_samples)
