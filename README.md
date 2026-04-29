@@ -1,13 +1,14 @@
 <div align="center">
 
-# ⚡ vLLM Online Inference Benchmark & Optimization
+# ⚡ vLLM Online Tuner — VTA-Agent
 
-**基于 vLLM 的大语言模型在线推理服务性能评测与优化系统**
+**面向 vLLM 推理服务的 LLM 驱动闭环调参 Agent 与性能评测平台**
 
-[![Python 3.10](https://img.shields.io/badge/Python-3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![vLLM 0.6.x](https://img.shields.io/badge/vLLM-0.6.x-green?logo=v&logoColor=white)](https://github.com/vllm-project/vllm)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.5-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![CUDA 12.x](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![Tests 219 passed](https://img.shields.io/badge/Tests-219%20passed-success)](./tests)
 [![License: Academic](https://img.shields.io/badge/License-Academic-yellow)](./README.md)
 
 </div>
@@ -16,23 +17,26 @@
 
 ## 📖 项目简介
 
-本项目是一个面向 **vLLM 推理框架**的端到端性能评测与优化平台。通过系统化的基准测试，量化分析不同负载模式、请求速率、输入长度和前缀复用策略对在线推理服务的吞吐量与延迟的影响，为 LLM 推理服务的部署优化提供数据支撑和决策依据。
+本项目是一个面向 **vLLM 推理框架** 的全栈性能评测 + 自动调参平台。项目从"手工压测 + 手动选参"起步，逐步演进到"**LLM 驱动的闭环 Agent 调参 (VTA-Agent)**"：由 LLM 扮演 Diagnoser / Proposer / Reflector 三重角色，配合哨兵式 Judge 与 BO/敏感度分析等纯算法工具，自动探索 9 项 RESTART 参数的最佳组合。
 
 ### 🎯 研究目标
 
 - 在固定硬件与模型条件下，建立 **可复现的性能基准线**（Baseline）
-- 通过多维度参数扫描，分析 **请求到达模式**、**输入/输出长度分布**、**共享前缀比例** 对推理性能的影响
-- 探索基于实时监控指标的 **自适应参数调优策略**
+- 以 **WorkloadGenerator** 生成 prefill / decode / mixed / phase-switch 多种负载场景
+- 构建 **VTA-Agent**：LLM orchestrator + 算法 inner-loop tools，针对不同 workload 自动选择最优 vLLM 运行参数
+- 验证在 prefill_heavy / decode_heavy / mixed 三种负载上、达到 ≥ 10% 吞吐提升
 
 ### 📊 技术栈
 
 | 层级 | 技术 | 说明 |
 |------|------|------|
-| 推理框架 | [vLLM](https://github.com/vllm-project/vllm) | PagedAttention + Continuous Batching |
-| 模型 | Qwen2.5-3B-Instruct-AWQ | AWQ 4-bit 量化, ~2.69GB |
+| 推理框架 | [vLLM 0.6.x](https://github.com/vllm-project/vllm) | PagedAttention + Continuous Batching |
+| 模型 | Qwen3-8B (bf16) / Qwen2.5-3B-Instruct-AWQ | A6000 / 4060 双平台适配 |
 | 压测引擎 | aiohttp + asyncio | 异步并发，支持流式 SSE |
 | 监控 | pynvml + Prometheus | GPU 指标 + vLLM 内部指标 |
 | 负载生成 | 自研 WorkloadGenerator | 可编程、可复现的请求序列 |
+| Agent 主脑 | OpenAI 兼容 LLM (GPT-4 / DeepSeek / …) | function-calling 多轮工具调用 |
+| 算法工具 | Optuna TPE / 纯函数分析 | BO / Pareto / 敏感度 / 局部网格 |
 
 ---
 
@@ -107,33 +111,45 @@
 ## 🏗️ 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Experiment Config                        │
-│              (baseline_0.json + workload_*.json)                │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-              ┌────────────▼────────────┐
-              │   WorkloadGenerator     │
-              │  (burst/rate/poisson)   │
-              └────────────┬────────────┘
-                           │ 请求序列
-              ┌────────────▼────────────┐
-              │   Benchmark Engine      │
-              │  (aiohttp + asyncio)    │
-              │  ┌──────────────────┐   │        ┌──────────────────┐
-              │  │ Streaming SSE    │───┼───────► │  vLLM Server     │
-              │  │ Token Counter    │   │         │  (OpenAI API)    │
-              │  └──────────────────┘   │         └──────────────────┘
-              └────────────┬────────────┘
-                           │
-            ┌──────────────┼──────────────┐
-            │              │              │
-   ┌────────▼───────┐ ┌───▼──────┐ ┌─────▼─────────┐
-   │  GPU Monitor   │ │  vLLM    │ │   Results      │
-   │  (pynvml)      │ │ Metrics  │ │  (.json/.txt)  │
-   │  500ms sample  │ │ 1s pull  │ │                │
-   └────────────────┘ └──────────┘ └────────────────┘
+                            ┌────────────────────────────────┐
+                            │    VtaAgent (run loop)         │
+                            │  Observe → Diagnose → Propose  │
+                            │  → Safety → Act → Reflect      │
+                            └──────┬──────┬──────────────────┘
+      ┌──────────────────────────┬┴───┐  │
+      ▼                          ▼    ▼  ▼
+  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐    ┌────────────────┐
+  │ A-LLM   │ │ P-LLM   │ │ R-LLM   │ │ Judge   │    │ ToolRegistry   │
+  │Diagnose │ │Propose  │ │Reflect  │ │(rules)  │    │ A: read-only 6 │
+  │ (JSON)  │ │+ tools  │ │+ notes  │ └─────────┘    │ B: BO/grid 5   │
+  └─────┬───┘ └────┬────┘ └────┬────┘                └───────┬────────┘
+        └─────────┴────┬───────┴──── LlmClient (OpenAI compat) ────────┘
+                       │
+        ┌──────────────┼──────────────┬──────────────┐
+        ▼              ▼              ▼              ▼
+   ┌─────────┐   ┌─────────┐   ┌──────────┐   ┌──────────┐
+   │ Memory  │   │ Param   │   │ Runner   │   │ Launcher │
+   │+notes   │   │Registry │   │+early    │   │  vLLM    │
+   │+rejected│   │ 9 specs │   │ stop     │   │  ctrl    │
+   └────┬────┘   └─────────┘   └────┬─────┘   └────┬─────┘
+        │                            │              │
+        ▼                       ┌────┴───────────────┴─────┐
+   memory.jsonl                  │ Benchmark Engine          │
+                                 │ + GPU/vLLM Monitors       │ ◄── vLLM Server
+                                 └────────────┬──────────────┘     (OpenAI API)
+                                              ▼
+                                  results/<exp_id>/summary.json
 ```
+
+### 🔄 主循环一轮运作
+
+1. **Observe**：Memory 返回最近 trial + top-k
+2. **Diagnose**：A-LLM 给出 `bottleneck` + `hypothesis` + `should_stop`
+3. **Propose**：P-LLM 多轮 function-calling，调用 BO/sensitivity 等工具 → `ConfigDelta`
+4. **Safety**：Judge 检查值域 / 是否最近被拒 / 是否重复 → 不通过则记一笔 `rejected` 后重取
+5. **Act**：Runner 重启 vLLM + 跑 benchmark + 轮询早停 → `TrialMetrics`
+6. **Reflect**：R-LLM 给出 `verdict` + `next_move_hint`，写一条 `note` 进 Memory
+7. **Loop / Stop**：Judge.should_terminate 检查 max_steps / 收敛；R-LLM 主动建议 stop
 
 ---
 
@@ -144,34 +160,54 @@
 
 ```
 vlllm/
-├── benchmarks/                     # 压测执行
-│   ├── run_benchmark.py            #   核心压测脚本（异步并发 + 多模式请求）
-│   └── prompts.json                #   5 条测试 prompt 样本（短/中/长）
-├── monitors/                       # 基础设施监控
-│   ├── gpu_monitor.py              #   GPU 利用率/显存/温度/功耗采集
-│   └── vllm_metrics_collector.py   #   vLLM Prometheus metrics 采集
-├── workloads/                      # 负载生成与语料管理
-│   ├── workload_generator.py       #   可编程负载生成器
+├── tuner/                          # ⏳ VTA-Agent 核心 (Week 6 + 7)
+│   ├── agent.py                    #   VtaAgent 主循环
+│   ├── launcher.py                 #   VllmLauncher—启停/重启 vLLM
+│   ├── runner.py                   #   单 trial 闭环执行器 + 轮询早停
+│   ├── config_generator.py         #   实验配置渲染 + 临时文件写入
+│   ├── metrics_parser.py           #   results/<exp_id>/ → TrialMetrics
+│   ├── memory.py                   #   ExperienceMemory + JSONL 落盘
+│   ├── param_registry.py           #   9 项 RESTART 参数事实表
+│   ├── tools.py                    #   ToolRegistry (A 类只读 6 个)
+│   ├── optimizer.py                #   B 类算法工具 (5 个)
+│   └── judge.py                    #   安全闸 / SLO / 收敛检测
+├── llm_advisor/                    # 🧠 LLM 客户端 + 三重角色
+│   ├── llm_client.py               #   OpenAI 兼容 + tool-calling 多轮
+│   ├── prompts.py                  #   A/P/R-LLM + Reporter system/user 模板
+│   ├── schemas.py                  #   DiagnosisResult / ConfigDelta / Reflection
+│   ├── diagnoser.py                #   A-LLM—诊断瓶颈
+│   ├── proposer.py                 #   P-LLM—提议参数改动与 BO
+│   └── reflector.py                #   R-LLM—反思 + 长期笔记
+├── benchmarks/                     # 📊 压测引擎
+│   ├── run_benchmark.py            #   异步并发 + summary.json 聚合
+│   └── prompts.json
+├── monitors/                       # 📈 指标采集
+│   ├── gpu_monitor.py              #   pynvml 周期采集
+│   └── vllm_metrics_collector.py   #   /metrics Prometheus 解析
+├── workloads/                      # 🎬 负载生成
+│   ├── workload_generator.py
 │   ├── prompts_pool.json           #   30+ 条分类 prompt 语料池
 │   └── prefix_pool.json            #   5 组共享前缀模板
-├── configs/                        # 实验配置
-│   ├── experiments/
-│   │   └── baseline_0.json         #   Baseline 0 完整配置
-│   ├── workloads/                  #   15 个 workload 配置
-│   └── llm_prompts/
-│       └── few_shot_examples.json  #   LLM Advisor few-shot 示例
-├── scripts/                        # 自动化脚本
-│   ├── setup/                      #   环境安装与初始化
-│   ├── server/                     #   服务启停与健康检查
-│   ├── experiment/                 #   实验执行
-│   ├── verify/                     #   验证与检查
-│   ├── test/                       #   测试脚本
-│   └── tools/                      #   工具脚本
-├── tests/                          # 单元测试（5 个模块）
-├── docs/                           # 文档
-├── results/                        # 实验结果
-├── logs/                           # 运行日志
-└── requirements.txt                # Python 依赖
+├── configs/                        # ⚙️ 配置
+│   ├── experiments/                #   baseline_0 / baseline_a6000_0
+│   ├── profiles/                   #   profile_{L,B,T}.json (Week 5)
+│   ├── workloads/                  #   15 个 workload 预设
+│   └── llm_prompts/few_shot_examples.json
+├── scripts/                        # 🔨 自动化脚本
+│   ├── setup/  server/  experiment/  verify/  test/  tools/
+├── tests/                          # ✅ 219 passed / 2 skipped
+│   ├── test_run_benchmark.py / test_workload_generator.py / test_configs.py
+│   ├── test_gpu_monitor.py / test_vllm_metrics_collector.py / test_metrics_aggregation.py
+│   ├── test_tuner_launcher.py / test_metrics_parser_and_runner.py
+│   ├── test_memory.py / test_param_registry.py / test_tools.py / test_optimizer.py
+│   ├── test_llm_client.py
+│   ├── test_diagnoser.py / test_proposer.py / test_reflector.py
+│   ├── test_judge.py / test_agent.py
+│   └── test_integration_week6_7.py # 🔗 Week 6+7 联合集成测试
+├── docs/                           # 📖 研究范围 / 环境 / 迁移 / 故障排查
+├── results/                        # 💾 实验结果
+├── logs/                           #     运行日志
+└── requirements.txt                #     Python 依赖
 ```
 
 </details>
@@ -260,6 +296,38 @@ bash scripts/experiment/run_baseline.sh
 
 > 自动完成：环境信息采集 → 启动服务 → 验证 → 压测 → 结果汇总
 
+### 5️⃣ 运行 VTA-Agent 自动调参
+
+```python
+# Python 脚本示例（详见 tuner/agent.py）
+from llm_advisor.llm_client import LlmClient, LlmClientConfig
+from tuner.agent import VtaAgent
+from tuner.judge import Judge
+from tuner.memory import ExperienceMemory
+from tuner.optimizer import B_TOOL_SPECS
+from tuner.runner import run_trial
+from tuner.tools import ToolRegistry
+
+memory = ExperienceMemory(path="results/tuning/memory.jsonl")
+tools  = ToolRegistry(memory, extra_tools=B_TOOL_SPECS)
+judge  = Judge(memory, max_steps=20)
+
+# client=None 走 fallback；填入 API key 启用 LLM 决策
+client = LlmClient(LlmClientConfig(api_key="sk-...", base_url="https://api.openai.com/v1"))
+
+def runner_fn(cfg, *, baseline_throughput_tok_per_s):
+    return run_trial(cfg,
+                     base_config_path="configs/experiments/baseline_a6000_0.json",
+                     workload_path="configs/workloads/workload_decode_heavy.json",
+                     baseline_throughput_tok_per_s=baseline_throughput_tok_per_s)
+
+agent = VtaAgent(memory, tools, judge, runner_fn, client=client, run_id="demo")
+report = agent.run(baseline_metrics, baseline_config={"max_num_seqs": 32}, max_steps=20)
+print(report.to_dict())
+```
+
+> Week 8 将提供 `scripts/experiment/run_tuning.sh` 一键 CLI 包装。
+
 ---
 
 ## ⚙️ 实验配置
@@ -329,13 +397,34 @@ source ~/vllm-venv/bin/activate
 python3 -m pytest tests/ -v
 ```
 
-| 测试模块 | 覆盖范围 |
-|:---------|:---------|
-| `test_run_benchmark.py` | 统计计算、格式化输出、trace 构建 |
-| `test_workload_generator.py` | 到达模式、prompt 采样、可复现性 |
-| `test_configs.py` | 配置完整性、prompt 池、prefix 池格式 |
-| `test_gpu_monitor.py` | 生命周期、daemon 线程、采样、优雅降级 |
-| `test_vllm_metrics_collector.py` | Prometheus 解析、端点不可用降级 |
+当前状态：**219 passed / 2 skipped**（skip 项为需要真 vLLM 进程的 launcher 集成测）。
+
+| 层级 | 测试模块 | 覆盖 |
+|:-----|:---------|:-----|
+| Week 1–4 | `test_run_benchmark.py` / `test_workload_generator.py` / `test_configs.py` / `test_gpu_monitor.py` / `test_vllm_metrics_collector.py` | 压测、负载生成、监控、指标聚合 |
+| Week 5–6 | `test_tuner_launcher.py` / `test_metrics_parser_and_runner.py` / `test_metrics_aggregation.py` | Launcher / Runner / TrialMetrics |
+| Week 6 | `test_memory.py` / `test_param_registry.py` / `test_tools.py` / `test_optimizer.py` / `test_llm_client.py` | Memory / 9 参数 / 工具调度 / BO / OpenAI 客户端 |
+| Week 7 | `test_diagnoser.py` / `test_proposer.py` / `test_reflector.py` / `test_judge.py` / `test_agent.py` | A/P/R-LLM 三重角色 + Judge + 主循环 |
+| 🔗 联合 | `test_integration_week6_7.py` | Mock LLM + Mock Runner 跑完整 VtaAgent.run 路径 |
+
+> 所有 LLM 调用点（A/P/R-LLM）都有 **fallback 规则版**：client=None 也能完整跑完，所以 CI 不依赖任何 LLM API。
+
+---
+
+## 📈 项目路线图
+
+| Week | 主题 | 状态 |
+|:-----|:-----|:----:|
+| 1 | 研究定义 + 工程骨架 | ✅ |
+| 2 | 压测链路 + Baseline 0 | ✅ |
+| 3 | Workload Generator | ✅ |
+| 4 | Monitor + Data Pipeline | ✅ |
+| 5 | A6000 + Qwen3-8B 迁移 | ✅ |
+| 6 | VTA-Agent 基础设施（Runner / Memory / Tools / LlmClient） | ✅ |
+| 7 | VTA-Agent 闭环决策主脑（A/P/R-LLM + Judge） | ✅ |
+| 8 | Reporter + 5 组消融 + 最终报告 | ⏳ |
+
+进度看板：[Issue #1 毕设任务看板](https://github.com/peilin6/vllm-online-tuner/issues/1)
 
 ---
 
@@ -347,11 +436,13 @@ python3 -m pytest tests/ -v
 | `torch` | 随 vllm 安装 | 深度学习框架 |
 | `transformers` | ≥4.40.0, <4.50.0 | 模型加载 / Tokenizer |
 | `aiohttp` | ≥3.9.0 | 异步 HTTP 客户端 |
-| `requests` | ≥2.31.0 | HTTP 客户端 |
-| `numpy` | ≥1.26.0 | 数据处理 |
-| `pandas` | ≥2.1.0 | 数据分析 |
+| `optuna` | ≥4.0.0 | TPE 贝叶斯优化（`bo_suggest` 工具）|
 | `pynvml` | ≥11.5.0 | GPU 监控 |
-| `tqdm` | ≥4.66.0 | 进度条 |
+| `numpy` / `pandas` | latest | 指标聚合与分析 |
+| `pytest` + `pytest-timeout` | ≥8.0 / ≥2.4 | 测试框架 |
+| `requests` / `tqdm` | latest | HTTP / 进度条 |
+
+> LLM API 客户端内置于 [`llm_advisor/llm_client.py`](llm_advisor/llm_client.py)，只依赖标准库 `urllib`，不需额外 SDK；OpenAI 兼容接口均可接入（OpenAI / DeepSeek / 智谱 / 本地 vLLM 等）。
 
 ---
 
