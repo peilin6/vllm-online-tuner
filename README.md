@@ -8,7 +8,7 @@
 [![vLLM 0.6.x](https://img.shields.io/badge/vLLM-0.6.x-green?logo=v&logoColor=white)](https://github.com/vllm-project/vllm)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.5-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![CUDA 12.x](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
-[![Tests 219 passed](https://img.shields.io/badge/Tests-219%20passed-success)](./tests)
+[![Tests 256 passed](https://img.shields.io/badge/Tests-256%20passed-success)](./tests)
 [![License: Academic](https://img.shields.io/badge/License-Academic-yellow)](./README.md)
 
 </div>
@@ -150,6 +150,106 @@
 5. **Act**：Runner 重启 vLLM + 跑 benchmark + 轮询早停 → `TrialMetrics`
 6. **Reflect**：R-LLM 给出 `verdict` + `next_move_hint`，写一条 `note` 进 Memory
 7. **Loop / Stop**：Judge.should_terminate 检查 max_steps / 收敛；R-LLM 主动建议 stop
+
+### 🧭 VTA-Agent 优化 vLLM 参数的基本规则、限制与逻辑
+
+当前实现把 `rule.txt` 中的 vLLM 调优经验收敛为三层硬约束：**A-LLM 只负责按指标诊断瓶颈**，**P-LLM 只能按 Playbook 白名单提议 1 个 RESTART 参数改动**，**Judge 在执行前后做安全闸与 SLO 校验**。因此 agent 的实际调参单位不是“自由改配置”，而是“观测指标 → 命中规则 → 从对应参数白名单中按方向选一个候选值 → 重启 vLLM 压测 → 接受或回滚”。
+
+#### 1. 闭环与安全边界
+
+| 环节 | 输入/依据 | 硬性限制 | 输出/动作 |
+|:-----|:---------|:---------|:---------|
+| Observe | 最新 trial、baseline、Memory top-k、最近 trial、rejected 记录 | 指标缺失值为 `-1` 时不得用作诊断依据 | 构造 A-LLM 诊断上下文 |
+| Diagnose | `preempt_rate_per_min`、`kv_cache_usage_p95`、`queue_time_p95`、TTFT/TPOT/latency 与 baseline/SLO 对比 | 必须按 R1→R8 顺序命中；瓶颈只能从固定枚举中选择 | `bottleneck`、`confidence`、单参数方向性 `hypothesis` |
+| Propose | Diagnosis + Playbook + ParamRegistry + Memory | 每轮只改 **1 个** 参数；必须在 Playbook `allowed_params` 内；方向必须匹配 `up/down/toggle`；新值必须来自登记候选或合法范围；不得复用最近 3 条 rejected 的 `(param, value)` | `ConfigDelta(param, old_value, new_value, reason, rollback_if)` 或 stop |
+| Safety | Judge + ParamRegistry + Memory | 参数必须已登记；值必须在 `candidates/range` 内；不能与当前 best/current 完全重复；不能命中最近 rejected | 通过则执行 trial；拒绝则写入 `rejected_proposals` |
+| Act | Runner + Launcher + benchmark | 当前登记参数均为 RESTART 类参数，生效需要重启 vLLM 后重新压测 | 生成新 trial metrics |
+| Constraint | 新 trial metrics + baseline | trial 失败/早停拒绝；TTFT P95 或 latency P95 超过 baseline×1.2 拒绝；preemption > 5/min 拒绝 | `pass/violations` |
+| Reflect | proposal、改动前后 trial、约束检查、历史 notes | 只有 `accept` 且约束通过才更新 current config；否则回滚到上一个 accepted config | 写入经验 note，给出下一步 `explore/double_down/rollback/stop` |
+| Stop | Judge / Diagnoser / Reflector | 达到 `max_steps`；最近窗口吞吐变化 <2%；诊断为 `converged`；R-LLM 建议 stop | 输出最终报告与 best trial |
+
+#### 2. 诊断规则到调参动作映射
+
+| 优先级 | 命中信号 | 诊断瓶颈 | P-LLM 允许调整的参数与方向 | 主要逻辑 |
+|:------|:---------|:---------|:--------------------------|:---------|
+| R1 | `preempt_rate_per_min > 5` | `preempt_storm` | ↑ `gpu_memory_utilization`；↓ `max_num_seqs`；↓ `max_num_batched_tokens`；↑ `swap_space`；toggle `enable_chunked_prefill` | 抢占说明 KV/批调度压力过高，优先给 KV 腾显存，其次降并发和 token budget；`swap_space` 只作为重算成本高时的补救 |
+| R2 | `kv_cache_usage_p95 > 0.95` | `kv_cache_pressure` | ↑ `gpu_memory_utilization`；↓ `max_num_seqs`；↓ `max_num_batched_tokens`；toggle `block_size` | KV cache 接近上限，按 `rule.txt` 优先增加可用显存比例，必要时降低同轮序列数或 token 数 |
+| R3 | `queue_time_p95_ms > latency_p95_ms × 0.3` | `queue_backlog` | ↑ `max_num_seqs`；↑ `max_num_batched_tokens`；toggle `enable_chunked_prefill` | 排队占比高说明调度容量不足，增大 batch/并发以提升吞吐，但仍受 SLO 与 KV 安全闸约束 |
+| R4 | `TTFT` 或 `latency` 的 SLO headroom <10% | `slo_margin_low` | ↓ `max_num_batched_tokens`；↓ `max_num_seqs`；toggle `enable_chunked_prefill` | 延迟余量不足时不再激进扩吞吐，优先缩小 batch/token budget 保护 P95/P99 |
+| R5 | TTFT 比 baseline 高 ≥20%，且 TPOT 增幅 <10% | `prefill_bound` | ↑ `max_num_batched_tokens`；toggle `enable_chunked_prefill`；toggle `enable_prefix_caching`；↓ `max_num_seqs` | 长 prompt/prefill 慢时增大 prefill token 处理能力；共享前缀场景启用 prefix caching；KV 紧张才降并发 |
+| R6 | TPOT 比 baseline 高 ≥20%，且 TTFT 增幅 <10% | `decode_bound` | ↓ `max_num_batched_tokens`；↓ `max_num_seqs`；toggle `enable_prefix_caching` | decode 慢通常受 memory bandwidth 与 prefill 干扰影响，降低 token budget 和并发以改善 ITL/TPOT |
+| R7 | 最近 3 步吞吐极差 <2%，且 SLO 余量充足 | `converged` | 禁止继续调参 | 认为搜索收益已经很小，Proposer 输出 stop |
+| R8 | 以上均不满足 | `underutilized` | ↑ `max_num_batched_tokens`；↑ `max_num_seqs`；↑ `gpu_memory_utilization` | 无明显 KV/preempt/queue/SLO 风险时按吞吐优先策略扩大批处理能力 |
+
+#### 3. vLLM 可观测 Metrics 完整指标表
+
+Agent / Judge / Playbook 决策所依赖的全部 trial-level 标量指标，由 [`tuner/metrics_parser.py`](tuner/metrics_parser.py) 的 `TrialMetrics` 数据类承载，从 `results/<exp_id>/summary.json` 解析得出。
+
+**A. 吞吐与延迟（核心 SLO 指标）**
+
+| 字段 | 单位 | 含义 | 主要用途 |
+|:-----|:----|:----|:--------|
+| `throughput_req_per_s` | req/s | 请求级吞吐 | 评分主指标之一；R7 收敛检测 |
+| `throughput_tok_per_s` | tok/s | Token 级吞吐 | `_score()` 默认排序键；BO/敏感度的 target |
+| `ttft_p95_ms` | ms | 首 token 时间 P95 | R5 prefill_bound 判定；TTFT SLO 余量计算 |
+| `tpot_p95_ms` | ms | 单 token 间隔 P95 | R6 decode_bound 判定 |
+| `latency_p95_ms` | ms | 端到端延迟 P95 | SLO 余量；Pareto 前沿目标 |
+
+**B. KV / 调度健康度（瓶颈侧标）**
+
+| 字段 | 单位 | 含义 | 主要用途 |
+|:-----|:----|:----|:--------|
+| `preemptions_total` | 次 | trial 内累计 preempt 次数 | R1 preempt_storm 触发条件之一 |
+| `preemption_rate_per_min` | 次/分钟 | 单位时间 preempt 速率 | R1 主信号（≥ 阈值 → preempt_storm） |
+| `kv_cache_usage_p95_pct` | 0–1 | KV cache 占用率 P95 | R2 kv_cache_pressure (>0.95)；R8 underutilized (<阈值) |
+| `queue_time_p95_ms` | ms | 请求排队时间 P95 | R3 queue_bound 判定（queue/latency 比例） |
+
+**C. 任务可信度与状态**
+
+| 字段 | 单位 | 含义 | 主要用途 |
+|:-----|:----|:----|:--------|
+| `success` | bool | trial 是否成功（success_rate ≥ 0.95 且未早停） | `_score` 失败置 −1；过滤 BO 训练点 |
+| `early_killed` | bool | 是否被 Judge 提前终止 | 区分主动失败 vs 自然失败 |
+| `wall_time_s` | s | trial 实际墙钟时间 | 预算控制 |
+| `success_rate` | 0–1 | 成功请求占比 | 进入 success 判定 |
+| `total_requests` | 个 | 该 trial 发出的请求总数 | 数据可信度参考 |
+| `notes` | list[str] | 解析阶段附加说明 | 调试用 |
+
+**D. 上游原始指标来源（采集层 → 解析层映射）**
+
+以上字段由 `summary.json` 中以下原始字段汇总而来（[`metrics_parser.py`](tuner/metrics_parser.py) 中的映射）：
+
+| TrialMetrics 字段 | summary.json 源路径 |
+|:------------------|:-------------------|
+| `throughput_req_per_s` | `throughput_rps` |
+| `throughput_tok_per_s` | `token_throughput_tps` |
+| `ttft_p95_ms` | `ttft_ms.p95` |
+| `tpot_p95_ms` | `tpot_ms.p95` |
+| `latency_p95_ms` | `latency_ms.p95` |
+| `preemptions_total` | `vllm_aggregates.preemptions_total` |
+| `preemption_rate_per_min` | `vllm_aggregates.preemption_rate_per_min` |
+| `kv_cache_usage_p95_pct` | `vllm_aggregates.kv_cache_usage_p95_pct` |
+| `queue_time_p95_ms` | 由 `vllm_aggregates.queue_time_delta_s` 推导（histogram 仅含 `_sum`） |
+| `success_rate` | `success_rate` |
+| `wall_time_s` | `wall_time_s`（可由 Runner 覆盖） |
+
+> 采集源：vLLM `/metrics` Prometheus 端点（KV/preempt/queue）+ aiohttp 压测客户端（throughput/TTFT/TPOT/latency）+ pynvml（GPU 利用率，用于诊断但不存入 TrialMetrics）。
+
+#### 4. 当前可调 RESTART 参数事实表
+
+| 参数 | 候选/范围 | 默认值 | 主要影响 | Agent 使用限制与调参含义 |
+|:-----|:----------|:------|:---------|:--------------------------|
+| `max_num_seqs` | 候选 `[8,16,32,64,96,128,192,256]`；范围 `1–512` | `32` | 吞吐、KV cache、TTFT | ↑ 提升并发和吞吐但增加 KV 压力；↓ 用于 preempt、KV 压力、decode 慢或 SLO 余量低 |
+| `max_num_batched_tokens` | 候选 `[1024,2048,4096,8192,16384]`；范围 `256–32768` | `2048` | 吞吐、TTFT、TPOT | ↑ 增强 prefill/吞吐；↓ 降低 decode 干扰、P99 和 KV 压力；是吞吐/延迟权衡的核心旋钮 |
+| `gpu_memory_utilization` | 候选 `[0.80,0.85,0.88,0.90,0.92,0.95]`；范围 `0.50–0.97` | `0.90` | KV cache、吞吐、稳定性 | ↑ 给 KV cache 更多空间；超过 `0.95` 附近 OOM/CUDA graph 风险升高，必须由 Judge 和 trial 验证 |
+| `block_size` | 候选 `[8,16,32]`；范围 `8–32` | `16` | KV cache、吞吐 | 只在 KV 压力场景 toggle；小 block 提高内存利用率但元数据更多，大 block 相反 |
+| `enable_chunked_prefill` | 候选 `[True, False]` | `True` | TTFT、TPOT、公平性 | prefill、queue、preempt、SLO 场景可切换；通常建议开启以让 prefill/decode 混合调度并降低 decode 抖动 |
+| `enable_prefix_caching` | 候选 `[True, False]` | `False` | TTFT、KV cache | prefill 或 decode 场景可切换；大量重复系统 prompt/RAG 模板时优先开启，但需观察 KV 占用 |
+| `swap_space` | 候选 `[0,2,4,8,16]`；范围 `0–64` GB | `4.0` | preempt recovery、吞吐 | 仅 preempt storm 场景允许 ↑；可能减少重算但 swap-in 慢，不能替代降低 KV 压力 |
+| `cuda_graph_sizes` | 候选 `default/small/wide/off` | `default` | 启动时间、TPOT | 当前 Playbook 未主动使用；保留给 CUDA Graph 命中率/启动时间权衡实验 |
+| `tensor_parallel_size` | 候选 `[1,2,4,8]`；范围 `1–8` | `1` | 吞吐、显存、延迟 | 当前 Playbook 未主动使用；多卡时可减轻单卡显存压力，但通信开销可能抵消收益 |
+
+> 说明：`rule.txt` 还列出了 `max_model_len`、`kv_cache_dtype`、`api_server_count`、`renderer_num_workers`、`async_scheduling`、`pipeline_parallel_size`、`data_parallel_size` 等 vLLM 重要参数；当前 Agent 为了保证可复现实验与安全搜索，只把上表 9 个 RESTART 参数纳入 `ParamRegistry` 和 Judge 白名单。新增参数前必须先补充候选值、范围、Playbook 方向、测试与回滚策略。
 
 ---
 

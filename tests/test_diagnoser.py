@@ -71,15 +71,99 @@ def test_fallback_kv_pressure():
 
 
 def test_fallback_slo_margin_low():
-    rec = _record("t1", throughput_tok_per_s=800.0)  # baseline 1000 * 0.95 = 950 > 800
+    # R4: ttft_headroom < 0.10 即触发（不再依赖 throughput）
+    rec = _record("t1", ttft_p95_ms=290.0)   # ttft_slo=300 -> headroom 3.3%
     res = _fallback_diagnose(rec, baseline=_metrics(throughput_tok_per_s=1000.0))
     assert res.bottleneck == "slo_margin_low"
+    assert "(R4)" in res.evidence
 
 
 def test_fallback_underutilized_default():
     rec = _record("t1")  # 健康
     res = _fallback_diagnose(rec, baseline=_metrics())
     assert res.bottleneck == "underutilized"
+    assert "(R8)" in res.evidence
+
+
+# -------------------- 新增 R3/R5/R6/R7 fallback 覆盖 --------------------
+def test_fallback_queue_backlog_R3():
+    # queue_time / latency = 1500/2000 = 75% > 30%
+    rec = _record("t1", queue_time_p95_ms=1500.0, latency_p95_ms=2000.0)
+    res = _fallback_diagnose(rec, baseline=_metrics())
+    assert res.bottleneck == "queue_backlog"
+    assert "(R3)" in res.evidence
+
+
+def test_fallback_prefill_bound_R5():
+    # baseline ttft=200/tpot=20，新 ttft=260(+30%)，tpot=21(+5%)
+    rec = _record("t1", ttft_p95_ms=260.0, tpot_p95_ms=21.0)
+    res = _fallback_diagnose(rec, baseline=_metrics(ttft_p95_ms=200.0, tpot_p95_ms=20.0))
+    assert res.bottleneck == "prefill_bound"
+    assert "(R5)" in res.evidence
+
+
+def test_fallback_decode_bound_R6():
+    # baseline ttft=200/tpot=20，新 tpot=26(+30%)，ttft=210(+5%)
+    rec = _record("t1", ttft_p95_ms=210.0, tpot_p95_ms=26.0)
+    res = _fallback_diagnose(rec, baseline=_metrics(ttft_p95_ms=200.0, tpot_p95_ms=20.0))
+    assert res.bottleneck == "decode_bound"
+    assert "(R6)" in res.evidence
+
+
+def test_fallback_converged_R7():
+    # 最近 3 步吞吐极差 <2%、SLO 余量充足
+    mem = _mem_with_baseline()
+    for i, t in enumerate([1000.0, 1005.0, 1003.0]):
+        mem.add(TrialRecord(trial_id=f"t{i}", config={"max_num_seqs": 32},
+                            metrics=_metrics(throughput_tok_per_s=t), source="agent"))
+    rec = _record("latest")  # 健康
+    res = _fallback_diagnose(rec, baseline=_metrics(), memory=mem)
+    assert res.bottleneck == "converged"
+    assert res.should_stop is True
+    assert "(R7)" in res.evidence
+
+
+def test_fallback_priority_preempt_over_kv():
+    # preempt 与 kv 同时高，R1 优先
+    rec = _record("t1", preemption_rate_per_min=10.0, kv_cache_usage_p95_pct=0.97)
+    res = _fallback_diagnose(rec, baseline=_metrics())
+    assert res.bottleneck == "preempt_storm"
+
+
+def test_fallback_priority_kv_over_queue():
+    # kv 与 queue 都高，R2 优先
+    rec = _record("t1", kv_cache_usage_p95_pct=0.97,
+                  queue_time_p95_ms=1500.0, latency_p95_ms=2000.0)
+    res = _fallback_diagnose(rec, baseline=_metrics())
+    assert res.bottleneck == "kv_cache_pressure"
+
+
+def test_fallback_missing_baseline_skips_R5_R6():
+    # 没有 baseline 情况下，TPOT 高也不应误判 decode_bound
+    rec = _record("t1", tpot_p95_ms=100.0)
+    res = _fallback_diagnose(rec, baseline=None)
+    assert res.bottleneck == "underutilized"
+
+
+# -------------------- prompt 填充测试 --------------------
+def test_user_prompt_includes_pct_and_swing():
+    from llm_advisor.diagnoser import _build_user_prompt
+    mem = _mem_with_baseline()
+    for i, t in enumerate([900.0, 950.0]):
+        mem.add(TrialRecord(trial_id=f"t{i}", config={"max_num_seqs": 32},
+                            metrics=_metrics(throughput_tok_per_s=t), source="agent"))
+    rec = _record("latest", ttft_p95_ms=300.0, tpot_p95_ms=30.0)
+    user = _build_user_prompt(
+        latest=rec, baseline=_metrics(throughput_tok_per_s=1000.0,
+                                      ttft_p95_ms=200.0, tpot_p95_ms=20.0),
+        memory=mem, ttft_slo_ms=300.0, lat_slo_ms=5000.0,
+    )
+    # TTFT/TPOT 相对 baseline 百分比都注入了
+    assert "ttft_pct" not in user                     # 占位符全部已被 format 替换
+    assert "+50.0%" in user                           # tpot +50%
+    # 缺失字段段落存在（这里没有缺失，应输出"无"）
+    assert "缺失指标" in user
+
 
 
 # -------------------- LLM 路径 --------------------
@@ -144,9 +228,10 @@ def test_diagnose_no_client_uses_fallback():
 def test_diagnose_finds_baseline_from_memory():
     """不显式传 baseline，应自动从 memory 中 source='baseline' 找。"""
     mem = _mem_with_baseline(base_tput=1000.0)
-    rec = _record("t1", throughput_tok_per_s=800.0)
+    # R4 触发：ttft 接近 SLO 上限
+    rec = _record("t1", ttft_p95_ms=290.0)
     mem.add(rec)
-    res = diagnose(None, mem, rec)  # fallback 路径需 baseline 才能判 slo_margin_low
+    res = diagnose(None, mem, rec)
     assert res.bottleneck == "slo_margin_low"
 
 

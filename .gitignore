@@ -6,9 +6,26 @@ __pycache__/
 .venv/
 venv/
 
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
 # Logs
 logs/*.log
 logs/server.pid
+
+# Temporary debug files
+stdout.txt
+stderr.txt
+tmp_*.py
+*.log
+demo*.txt
+demo*.log
+smoke.log
+pt.log
+out.log
+algo_demo_out.txt
 
 # Results (keep structure, ignore large raw data)
 results/*.jsonl

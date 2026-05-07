@@ -1,33 +1,51 @@
 #!/usr/bin/env bash
 # =============================================================================
 # start_server.sh — 启动 vLLM OpenAI-compatible API 服务
-# 用法: bash scripts/server/start_server.sh [config_path]
-# 默认配置: configs/experiments/baseline_0.json
+# 用法: bash scripts/server/start_server.sh [config_path] [eager]
+# 默认配置: configs/experiments/baseline_a6000_0.json
 # =============================================================================
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-CONFIG="${1:-${PROJECT_DIR}/configs/experiments/baseline_0.json}"
+CONFIG="${1:-${PROJECT_DIR}/configs/experiments/baseline_a6000_0.json}"
 LOG_DIR="${PROJECT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/vllm_server_$(date +%Y%m%d_%H%M%S).log"
 
 mkdir -p "${LOG_DIR}"
 
 # ---------- 从 JSON 配置中解析参数 ----------
-MODEL=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['model']['name'])")
-HOST=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['server']['host'])")
-PORT=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['server']['port'])")
-TP=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['server']['tensor_parallel_size'])")
-GPU_UTIL=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['server']['gpu_memory_utilization'])")
-MAX_MODEL_LEN=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['model']['max_model_len'])")
-DTYPE=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print(c['model']['dtype'])")
-TRUST_REMOTE=$(python3 -c "import json; c=json.load(open('${CONFIG}')); print('--trust-remote-code' if c['model'].get('trust_remote_code') else '')")
+MODEL=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['model']['name'])")
+HOST=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['server']['host'])")
+PORT=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['server']['port'])")
+TP=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['server']['tensor_parallel_size'])")
+GPU_UTIL=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['server']['gpu_memory_utilization'])")
+MAX_MODEL_LEN=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['model']['max_model_len'])")
+DTYPE=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['model']['dtype'])")
+MAX_NUM_SEQS=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print(c['server'].get('max_num_seqs', ''))")
+QUANTIZATION=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); q=c['model'].get('quantization'); print(q or '')")
+TRUST_REMOTE=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print('--trust-remote-code' if c['model'].get('trust_remote_code') else '')")
+PREFIX_CACHING=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print('1' if c['server'].get('enable_prefix_caching') else '0')")
+CHUNKED_PREFILL=$(python3 -c "import json; c=json.load(open('${CONFIG}', encoding='utf-8')); print('1' if c['server'].get('enable_chunked_prefill') else '0')")
 
 # ENFORCE_EAGER=1 透传 --enforce-eager（Week 6 VllmLauncher 用，可绕过 CUDA graph 加速热重启）
 EAGER_FLAG=""
-if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
+if [ "${ENFORCE_EAGER:-0}" = "1" ] || [ "${2:-}" = "eager" ]; then
     EAGER_FLAG="--enforce-eager"
-    echo "[INFO] ENFORCE_EAGER=1 → 追加 --enforce-eager"
+    echo "[INFO] 追加 --enforce-eager"
+fi
+
+EXTRA_ARGS=()
+if [ -n "${MAX_NUM_SEQS}" ]; then
+    EXTRA_ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
+fi
+if [ -n "${QUANTIZATION}" ]; then
+    EXTRA_ARGS+=(--quantization "${QUANTIZATION}")
+fi
+if [ "${PREFIX_CACHING}" = "1" ]; then
+    EXTRA_ARGS+=(--enable-prefix-caching)
+fi
+if [ "${CHUNKED_PREFILL}" = "1" ]; then
+    EXTRA_ARGS+=(--enable-chunked-prefill)
 fi
 
 # ---------- 本地模型优先：本地有则用本地，没有则在线下载 ----------
@@ -50,6 +68,7 @@ echo " 模型: ${MODEL}"
 echo " 地址: ${HOST}:${PORT}"
 echo " TP:   ${TP}"
 echo " GPU利用: ${GPU_UTIL}"
+echo " max_num_seqs: ${MAX_NUM_SEQS:-默认}"
 echo " 日志: ${LOG_FILE}"
 echo "============================================"
 
@@ -62,6 +81,7 @@ nohup python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization "${GPU_UTIL}" \
     --max-model-len "${MAX_MODEL_LEN}" \
     --dtype "${DTYPE}" \
+    "${EXTRA_ARGS[@]}" \
     ${TRUST_REMOTE} \
     ${EAGER_FLAG} \
     > "${LOG_FILE}" 2>&1 &

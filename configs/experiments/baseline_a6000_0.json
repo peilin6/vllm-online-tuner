@@ -1,0 +1,42 @@
+{
+  "experiment": {
+    "name": "baseline_a6000_0",
+    "description": "A6000 + Qwen3-8B 首个 baseline"
+  },
+  "model": {
+    "name": "Qwen/Qwen3-8B",
+    "dtype": "bfloat16",
+    "quantization": null,
+    "max_model_len": 4096,
+    "trust_remote_code": true
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "tensor_parallel_size": 1,
+    "gpu_memory_utilization": 0.90,
+    "max_num_seqs": 64,
+    "enable_prefix_caching": false,
+    "enable_chunked_prefill": true,
+    "enforce_eager": false,
+    "api_type": "openai"
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "max_tokens": 256,
+    "stop": null
+  },
+  "benchmark": {
+    "num_requests": 50,
+    "concurrency": 1,
+    "request_rate": null,
+    "timeout_per_request": 180
+  },
+  "environment": {
+    "python_version": "3.10",
+    "cuda_version": "12.4",
+    "vllm_version": "0.6.6.post1",
+    "torch_version": "2.5.1+cu124"
+  }
+}

@@ -1,0 +1,463 @@
+下面按你要的三部分给一个可直接用于设计调参 agent 的框架。这里讨论的是 **vLLM 启动/Engine 参数**，很多参数不是热更新参数；agent 若要“调节运行时参数”，工程上通常要做成 **观测 → 判定瓶颈 → 生成新配置 → 灰度重启/蓝绿切换 → 对比指标 → 回滚或固化**。
+
+## 1. vLLM 推理过程中常见瓶颈
+
+### A. KV cache 显存不足 / preemption / recompute
+
+这是 vLLM 在线服务最常见的瓶颈之一。请求并发、长 prompt、长输出都会消耗 KV cache；当 KV cache 不足时，vLLM 会 preempt 一些请求，之后重新计算，直接拉高端到端延迟。官方文档明确建议在频繁 preemption 时增加 `gpu_memory_utilization`，或降低 `max_num_seqs` / `max_num_batched_tokens`，也可以增加 `tensor_parallel_size` 或 `pipeline_parallel_size` 给 KV cache 腾空间。vLLM V1 默认 preemption 模式是 `RECOMPUTE`，不是 `SWAP`。([vLLM][1])
+
+典型信号：preemption count 上升、KV cache 使用率接近上限、P99 延迟突然变差、吞吐下降但 GPU 并不一定满载。
+
+---
+
+### B. Prefill 瓶颈：长 prompt 导致 TTFT 高
+
+Prefill 阶段处理输入 tokens，通常更偏 compute-bound。长上下文、RAG 拼接大量文档、多轮长对话都会让 TTFT 变高。vLLM 的 chunked prefill 会把大 prefill 拆小，并与 decode 请求混合调度；官方文档说明 V1 在可能时默认启用 chunked prefill，并优先调度 decode，再用剩余 token budget 调度 prefill。([vLLM][1])
+
+典型信号：TTFT 高，prompt tokens/s 低，长 prompt 请求拖慢短请求。
+
+---
+
+### C. Decode 瓶颈：ITL 高、输出慢
+
+Decode 是逐 token 自回归生成，通常更偏 memory bandwidth-bound。并发多、输出长、batch 太大、prefill 与 decode 争抢资源，都会导致 ITL 升高。官方调优建议里，`max_num_batched_tokens` 小一些通常有利于 ITL，因为每轮里 prefill 对 decode 的干扰更少。([vLLM][1])
+
+典型信号：TTFT 可接受，但 token 间隔高；用户看到流式输出卡顿。
+
+---
+
+### D. Batch / Scheduler 瓶颈：吞吐与延迟权衡失衡
+
+`max_num_batched_tokens` 和 `max_num_seqs` 是调度层最核心的两个旋钮：前者限制单次 iteration 能处理的 token 总数，后者限制单次 iteration 的序列数。官方 CLI 文档也把它们列为 SchedulerConfig。([vLLM][2])
+
+典型信号：GPU 利用率低但排队高，说明 batch 太小或调度不充分；反之，如果 P99 高、preemption 多，可能 batch 太大。
+
+---
+
+### E. 重复 prefix 计算浪费
+
+系统 prompt、工具说明、RAG 模板、多租户固定前缀如果大量重复，不启用 prefix caching 会重复 prefill。vLLM 的 automatic prefix caching 会缓存已处理请求的 KV cache blocks，并在新请求有相同 prefix 时复用。([vLLM][3])
+
+典型信号：大量请求共享相同系统 prompt，但 TTFT 仍很高；prefix cache hit rate 低。
+
+---
+
+### F. CPU / 前端瓶颈：tokenization、chat template、JSON、日志、网络
+
+API server、tokenizer、chat template 渲染、多模态预处理、日志输出都可能成为瓶颈。vLLM CLI 有 `--renderer-num-workers`，用于 async tokenization、chat template rendering、多模态预处理线程池。([vLLM][2])
+
+典型信号：GPU 利用率不高，但请求排队；CPU 单核打满；开启 debug 日志后吞吐下降。
+
+---
+
+### G. 多 GPU 通信瓶颈
+
+TP 会带来 all-reduce 等通信，PP 会带来流水线气泡，DP 会增加副本但也需要负载均衡，MoE 的 EP 会引入 all-to-all。官方文档说明 TP 适合模型放不进单 GPU或需要腾出 KV cache，PP 适合 TP 已经不经济时继续切分模型，DP 适合有足够 GPU 复制模型、目标是扩展吞吐，EP 则针对 MoE。([vLLM][1])
+
+典型信号：多卡 GPU 利用不均，NCCL 时间高，TP size 增大后吞吐不升反降。
+
+---
+
+### H. 模型加载 / 冷启动瓶颈
+
+大模型加载、网络盘随机读、safetensors mmap、TP 多进程加载都会影响启动和滚动更新。vLLM 的 `--load-format` 支持 `auto`、`safetensors`、`bitsandbytes`、`sharded_state`、`gguf` 等，`--safetensors-load-strategy` 可选 lazy/eager/prefetch 等策略。([vLLM][2])
+
+典型信号：重启慢、扩容慢、Pod readiness 很久、网络盘 I/O 高。
+
+---
+
+## 2. 启动 vLLM 时和效率相关的主要参数
+
+vLLM 官方文档把 `vllm serve` 参数分成 Frontend、ModelConfig、LoadConfig、AttentionConfig、ParallelConfig、CacheConfig、OffloadConfig、MultiModalConfig、LoRAConfig、ObservabilityConfig、SchedulerConfig、CompilationConfig、KernelConfig、VllmConfig 等组。([vLLM][2])
+
+下面列效率相关的核心参数，不列所有功能型参数。
+
+### Scheduler / batching
+
+| 参数                                                         | 作用                                   | 主要影响                 |
+| ---------------------------------------------------------- | ------------------------------------ | -------------------- |
+| `--max-num-batched-tokens`                                 | 单次调度 iteration 最大 token 数            | TTFT / ITL / 吞吐 / 显存 |
+| `--max-num-seqs`                                           | 单次 iteration 最大序列数                   | 并发、吞吐、KV 压力          |
+| `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | 是否拆分 prefill                         | 长 prompt、ITL、TTFT    |
+| `--max-num-partial-prefills`                               | chunked prefill 并发 partial prefill 数 | 长 prompt 并发          |
+| `--max-long-partial-prefills`                              | 长 prompt partial prefill 并发限制        | 防长请求阻塞短请求            |
+| `--long-prefill-token-threshold`                           | 超过多少 token 算长 prompt                 | 长短请求隔离               |
+| `--scheduling-policy fcfs/priority`                        | 调度策略                                 | SLA / 优先级            |
+| `--async-scheduling`                                       | 异步调度，减少 GPU 空洞                       | GPU 利用率、延迟           |
+| `--stream-interval`                                        | 流式输出多少 token flush 一次                | 流畅度 vs 前端开销          |
+
+`--max-num-batched-tokens` 小一些通常改善 ITL，大一些通常改善 TTFT 和吞吐；官方建议追求吞吐时，尤其小模型在大 GPU 上可设到 `>8192`。([vLLM][1])
+
+---
+
+### KV cache / memory
+
+| 参数                           | 作用                           | 主要影响                |
+| ---------------------------- | ---------------------------- | ------------------- |
+| `--gpu-memory-utilization`   | vLLM 可使用的 GPU 显存比例           | KV cache 容量、OOM 风险  |
+| `--kv-cache-memory-bytes`    | 显式指定每 GPU KV cache 大小        | 比显存比例更精细            |
+| `--kv-cache-dtype`           | KV cache dtype，如 auto/fp8 等  | KV 容量、精度风险          |
+| `--enable-prefix-caching`    | 自动 prefix cache              | 重复 prompt TTFT      |
+| `--prefix-caching-hash-algo` | prefix cache hash 算法         | hash 开销、安全性         |
+| `--max-model-len`            | 最大上下文长度                      | KV 预算、可承载并发         |
+| `--kv-offloading-size`       | KV cache CPU offload buffer  | 显存压力、PCIe/NVLink 压力 |
+| `--kv-offloading-backend`    | KV offload 后端，native/lmcache | offload 行为          |
+
+`--gpu-memory-utilization` 默认值在当前文档中是 `0.92`；`--kv-cache-memory-bytes` 如果设置，会忽略 `gpu_memory_utilization`。`--kv-cache-dtype` 支持 auto、bf16、fp16、fp8 等选择。([vLLM][2])
+
+---
+
+### Model / precision / context
+
+| 参数                                                     | 作用                                  | 主要影响             |
+| ------------------------------------------------------ | ----------------------------------- | ---------------- |
+| `--dtype`                                              | 权重和激活 dtype，auto/bfloat16/float16 等 | 显存、速度、数值稳定       |
+| `--quantization`                                       | 权重量化方式                              | 显存、吞吐、精度         |
+| `--max-model-len`                                      | prompt + output 上限                  | 显存、KV cache、服务容量 |
+| `--max-logprobs`                                       | 允许返回的 logprobs 数量上限                 | 显存、CPU/GPU 后处理   |
+| `--disable-sliding-window`                             | 是否禁用 sliding window                 | 长上下文内存行为         |
+| `--generation-config` / `--override-generation-config` | 服务级生成默认值                            | 输出长度、采样开销        |
+
+`--dtype auto` 会对 FP32/FP16 模型用 FP16，对 BF16 模型用 BF16；`--max-model-len` 可用 `1k/1K/25.6k/auto` 这样的格式。([vLLM][2])
+
+---
+
+### Parallelism / distributed
+
+| 参数                                                       | 作用                           | 主要影响               |
+| -------------------------------------------------------- | ---------------------------- | ------------------ |
+| `--tensor-parallel-size`, `-tp`                          | 张量并行                         | 模型显存、KV 空间、通信开销    |
+| `--pipeline-parallel-size`, `-pp`                        | 流水线并行                        | 大模型容纳、延迟           |
+| `--data-parallel-size`, `-dp`                            | 数据并行副本                       | 吞吐、隔离              |
+| `--decode-context-parallel-size`, `-dcp`                 | decode context parallel      | 长上下文 decode        |
+| `--prefill-context-parallel-size`, `-pcp`                | prefill context parallel     | 长上下文 prefill       |
+| `--distributed-executor-backend`                         | mp/ray/uni/external_launcher | 多进程/多节点            |
+| `--numa-bind` / `--numa-bind-nodes` / `--numa-bind-cpus` | GPU worker NUMA 绑定           | 多 socket 主机性能      |
+| `--enable-dbo`                                           | dual batch overlap           | GPU pipeline 利用率   |
+| `--dbo-decode-token-threshold`                           | decode DBO 阈值                | decode microbatch  |
+| `--dbo-prefill-token-threshold`                          | prefill DBO 阈值               | prefill microbatch |
+
+官方文档说明 `--distributed-executor-backend` 可选 external_launcher、mp、ray、uni；`--tensor-parallel-size`、`--pipeline-parallel-size`、`--data-parallel-size` 分别控制 TP、PP、DP；`--numa-bind` 用于 GPU worker NUMA 绑定。([vLLM][2])
+
+---
+
+### MoE / expert parallel
+
+| 参数                            | 作用                             | 主要影响       |
+| ----------------------------- | ------------------------------ | ---------- |
+| `--enable-expert-parallel`    | MoE 使用专家并行                     | MoE 吞吐、显存  |
+| `--all2all-backend`           | MoE all-to-all 后端              | 通信性能       |
+| `--enable-eplb`               | expert parallel load balancing | 专家负载均衡     |
+| `--expert-placement-strategy` | linear / round_robin           | 专家分布       |
+| `--enable-ep-weight-filter`   | EP 加载时跳过非本地 expert 权重          | MoE 启动 I/O |
+
+这些参数主要用于 DeepSeek、Mixtral、Qwen MoE 等 MoE 模型；`--enable-expert-parallel` 会对 MoE 层使用专家并行，`--all2all-backend` 控制 EP 通信后端。([vLLM][2])
+
+---
+
+### CPU / offload
+
+| 参数                        | 作用                        | 主要影响                |
+| ------------------------- | ------------------------- | ------------------- |
+| `--cpu-offload-gb`        | 每 GPU offload 到 CPU 的权重大小 | 显存容量、PCIe/NVLink 压力 |
+| `--offload-backend`       | auto/prefetch/uva         | offload 实现          |
+| `--offload-group-size`    | 分组 offload 层              | 传输隐藏                |
+| `--offload-num-in-group`  | 每组 offload 几层             | 显存/传输               |
+| `--offload-prefetch-step` | 预取提前层数                    | 隐藏延迟、占用显存           |
+
+`--cpu-offload-gb` 可以把一部分权重放到 CPU，相当于“虚拟增加 GPU 显存”，但每次 forward 会访问 CPU 侧权重，需要较快 CPU-GPU 互联。([vLLM][4])
+
+---
+
+### Frontend / server
+
+| 参数                                | 作用                           | 主要影响       |
+| --------------------------------- | ---------------------------- | ---------- |
+| `--api-server-count`              | API server 进程数               | 前端吞吐       |
+| `--renderer-num-workers`          | tokenizer/template/MM 预处理线程数 | CPU 前处理瓶颈  |
+| `--enable-log-requests`           | 请求日志                         | 可观测性 vs 开销 |
+| `--disable-uvicorn-access-log`    | 关闭 access log                | 降低日志开销     |
+| `--max-log-len`                   | 日志长度                         | CPU/I/O    |
+| `--host` / `--port` / `--api-key` | 服务参数                         | 部署与安全      |
+
+`vllm serve` 是启动 OpenAI-compatible server 的命令，也支持 YAML config；若 CLI 与 config 同时设置，优先级是命令行 > config 文件 > 默认值。([vLLM][5])
+
+---
+
+### Compilation / CUDA Graph / kernel
+
+| 参数                             | 作用                           | 主要影响           |
+| ------------------------------ | ---------------------------- | -------------- |
+| `-O0/-O1/-O2/-O3`              | 优化等级                         | 启动时间 vs 性能     |
+| `--enforce-eager`              | 强制 eager，禁用 CUDA graph       | 调试 vs 性能       |
+| `--compilation-config` / `-cc` | torch.compile + cudagraph 配置 | 稳态性能           |
+| `--cudagraph-capture-sizes`    | 捕获哪些 batch size              | CUDA graph 命中率 |
+| `--max-cudagraph-capture-size` | 最大 capture size              | 启动时间、显存、性能     |
+| `--attention-backend`          | attention backend            | kernel 性能      |
+
+vLLM 有 `-O0` 到 `-O3` 四个优化等级：`-O0` 启动最快但性能最低，`-O2` 是默认优化，`-O3` 当前与 `-O2` 类似但未来可能包含更激进优化。([vLLM][1])
+
+---
+
+## 3. 不同瓶颈应该如何调这些参数
+
+### 3.1 KV cache 不足 / preemption 多
+
+优先动作：
+
+1. 增大 `--gpu-memory-utilization`，例如 `0.90 → 0.92 → 0.95`，但要留出 CUDA graph、fragmentation、其他进程空间。
+2. 如果需要更精细控制，用 `--kv-cache-memory-bytes`，它会覆盖 `gpu_memory_utilization`。
+3. 降低 `--max-num-seqs`，减少同一 iteration 并发序列。
+4. 降低 `--max-num-batched-tokens`，减少每轮 token 预算。
+5. 降低 `--max-model-len`，避免为超长上下文保留过大能力。
+6. 尝试 `--kv-cache-dtype fp8`，前提是模型和硬件支持，并接受精度验证成本。
+7. 多 GPU 时增加 `--tensor-parallel-size` 或 `--pipeline-parallel-size`，但要观察通信开销。
+
+官方针对 preemption 的建议正是增加 `gpu_memory_utilization`，降低 `max_num_seqs` / `max_num_batched_tokens`，或增加 TP/PP。([vLLM][1])
+
+---
+
+### 3.2 TTFT 高，主要是长 prompt / RAG prefill 慢
+
+优先动作：
+
+1. 确保 `--enable-chunked-prefill` 开启。
+2. 增大 `--max-num-batched-tokens`，例如从 `4096 → 8192 → 16384`，提高每轮 prefill token 处理能力。
+3. 如果长请求阻塞短请求，设置：
+
+   * `--long-prefill-token-threshold`
+   * `--max-num-partial-prefills`
+   * `--max-long-partial-prefills`
+4. 如果大量请求共享系统 prompt 或模板，开启 `--enable-prefix-caching`。
+5. 多 GPU 长上下文场景，考虑 `--prefill-context-parallel-size`。
+6. 如果 GPU 利用率低而 CPU 高，增加 `--renderer-num-workers`，减少 tokenizer/template 前处理阻塞。
+
+注意：`max_num_batched_tokens` 增大通常改善 TTFT 和吞吐，但可能牺牲 ITL 和 P99。官方文档也明确给出这个方向。([vLLM][1])
+
+---
+
+### 3.3 ITL 高，流式输出卡顿
+
+优先动作：
+
+1. 降低 `--max-num-batched-tokens`，例如 `16384 → 8192 → 4096 → 2048`。
+2. 降低 `--max-num-seqs`，避免过多 decode 序列争抢 memory bandwidth。
+3. 保持 chunked prefill 开启，让 decode 优先。
+4. `--stream-interval` 保持 `1` 可获得最平滑流式输出；若 CPU/frontend 压力大，可提高到 `5` 或 `10`，但用户看到的 token flush 会变粗。
+5. 尝试 `--async-scheduling`，减少调度造成的 GPU 空洞。
+6. 对长输出任务，考虑 speculative decoding 的 `--speculative-config`，但需要单独验证接受率和显存开销。
+
+官方文档指出小的 `max_num_batched_tokens` 更有利于 ITL，因为 prefill 对 decode 的干扰更少。([vLLM][1])
+
+---
+
+### 3.4 GPU 利用率低，吞吐低，但没有 OOM
+
+优先动作：
+
+1. 增大 `--max-num-batched-tokens`。
+2. 增大 `--max-num-seqs`。
+3. 确认 `--async-scheduling` 开启。
+4. 使用更高优化等级，例如默认 `-O2`，不要用 `--enforce-eager` 跑生产。
+5. 检查 tokenizer/template 是否 CPU 瓶颈；提高 `--renderer-num-workers` 或 `--api-server-count`。
+6. 如果是多卡小模型，TP 可能通信大于收益，考虑单卡多实例或 DP，而不是盲目增大 TP。
+
+吞吐优先场景下，官方建议 `max_num_batched_tokens > 8192`，尤其是小模型跑在大 GPU 上。([vLLM][1])
+
+---
+
+### 3.5 P99 高，但平均吞吐很好
+
+优先动作：
+
+1. 降低 `--max-num-batched-tokens`，优先保护 ITL/P99。
+2. 降低 `--max-num-seqs`，减少尾部排队和 KV 压力。
+3. 使用 `--scheduling-policy priority`，给交互请求更高优先级。
+4. 设置 `--long-prefill-token-threshold` 和 `--max-long-partial-prefills`，避免长 prompt 饿死短请求。
+5. 将 workload 拆分成两个 pool：低延迟 pool 和高吞吐 pool，agent 分别调参。
+
+---
+
+### 3.6 重复系统 prompt / agent 工具说明导致 TTFT 浪费
+
+优先动作：
+
+1. 开启 `--enable-prefix-caching`。
+2. 对多租户场景慎重选择 `--prefix-caching-hash-algo`；`xxhash` 更快但非加密 hash，安全隔离要求高时不要随意用。
+3. 让上游请求规范化系统 prompt，确保 token 序列完全一致。
+4. 对 RAG 模板，把固定说明放在 prefix，动态文档放后面，提高 cache hit。
+
+vLLM 的 prefix caching 是复用 KV cache blocks 来避免重复 prompt 计算。([vLLM][3])
+
+---
+
+### 3.7 显存不够放模型
+
+优先动作：
+
+1. 用 `--dtype half` / `--dtype bfloat16`，避免 FP32。
+2. 使用 `--quantization` 加载合适的量化模型。
+3. 增大 `--tensor-parallel-size`。
+4. 必要时使用 `--pipeline-parallel-size`。
+5. 最后考虑 `--cpu-offload-gb`，但它会引入 CPU-GPU 访问开销。
+6. 降低 `--max-model-len`，给权重和 CUDA graph 留空间。
+
+---
+
+### 3.8 多 GPU 扩展效率差
+
+优先动作：
+
+1. 如果模型单卡可放下且目标是吞吐，优先多实例或 `--data-parallel-size`，而不是过度 TP。
+2. 如果模型单卡放不下，用 `--tensor-parallel-size`。
+3. 如果 TP 已经通信开销明显，再考虑 `--pipeline-parallel-size`。
+4. 多 socket 机器开启 `--numa-bind`，必要时显式设置 `--numa-bind-nodes` / `--numa-bind-cpus`。
+5. MoE 模型用 `--enable-expert-parallel`，并调 `--all2all-backend`、`--enable-eplb`、`--expert-placement-strategy`。
+
+官方文档也说明 DP 适合扩展吞吐，TP/PP 更偏解决模型/显存问题，EP 针对 MoE。([vLLM][1])
+
+---
+
+### 3.9 前端 CPU / tokenizer / 日志瓶颈
+
+优先动作：
+
+1. 增大 `--renderer-num-workers`。
+2. 增大 `--api-server-count`。
+3. 关闭高频 access log：`--disable-uvicorn-access-log`。
+4. 避免 `--enable-log-requests` 在生产高 QPS 下打开 DEBUG 级 prompt 日志。
+5. 设置较小 `--max-log-len`。
+6. 上游尽量传 token IDs 或减少复杂 chat template 渲染。
+
+---
+
+### 3.10 多模态瓶颈
+
+优先动作：
+
+1. 调整 `--limit-mm-per-prompt`，限制每请求图片/视频数量、帧数、分辨率。
+2. 增大或合理设置 `--mm-processor-cache-gb`。
+3. 尝试 `--mm-processor-cache-type shm`，减少多进程重复缓存。
+4. 多模态 encoder 在 TP 下通信重时，尝试 `--mm-encoder-tp-mode data`。
+5. 视频请求可调 `--video-pruning-rate`。
+
+vLLM 文档说明多模态 processor cache 会按 `mm_processor_cache_gb * (api_server_count + data_parallel_size)` 消耗内存，因此 agent 调它时必须同时考虑 API server 数和 DP 数。([vLLM][2])
+
+---
+
+## 一个实用的 agent 调参策略
+
+你的 agent 不应该一次改很多参数。建议每轮只改 1–2 个主旋钮，并用固定压测窗口比较。
+
+### 输入指标
+
+至少收集：
+
+* TTFT p50/p95/p99
+* ITL p50/p95/p99
+* end-to-end latency p95/p99
+* request throughput
+* output tokens/s
+* prompt tokens/s
+* GPU utilization
+* GPU memory used / KV cache usage
+* preemption count
+* running requests / waiting requests
+* CPU utilization
+* tokenizer/template 耗时
+* error / OOM / timeout count
+
+### 判定逻辑示例
+
+| 观测现象                 | 判定              | 首选动作                                                                    |
+| -------------------- | --------------- | ----------------------------------------------------------------------- |
+| preemption 增多，P99 飙升 | KV cache 不足     | ↑ `gpu_memory_utilization`，↓ `max_num_seqs`，↓ `max_num_batched_tokens`  |
+| TTFT 高，ITL 正常        | prefill 瓶颈      | ↑ `max_num_batched_tokens`，开 prefix cache，调 chunked prefill             |
+| ITL 高，TTFT 正常        | decode 瓶颈       | ↓ `max_num_batched_tokens`，↓ `max_num_seqs`                             |
+| GPU 利用率低，队列高         | 调度/CPU 瓶颈       | ↑ batch 参数，↑ renderer workers，开 async scheduling                        |
+| GPU 满载，延迟高但吞吐高       | 过度 batching     | ↓ `max_num_batched_tokens` 或拆低延迟 pool                                   |
+| CPU 满，GPU 不满         | 前端/tokenizer 瓶颈 | ↑ `api-server-count`，↑ `renderer-num-workers`，降日志                       |
+| 多卡扩展差                | 通信瓶颈            | 降 TP，改 DP/多实例；MoE 调 EP/all2all                                          |
+| 冷启动慢                 | 加载瓶颈            | `--load-format sharded_state/safetensors`，调 `safetensors-load-strategy` |
+
+### 建议的基线配置模板
+
+```bash
+vllm serve /models/your-model \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype auto \
+  --gpu-memory-utilization 0.92 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 128 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --async-scheduling \
+  --disable-uvicorn-access-log
+```
+
+低延迟优先：
+
+```bash
+vllm serve /models/your-model \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 64 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --stream-interval 1
+```
+
+吞吐优先：
+
+```bash
+vllm serve /models/your-model \
+  --gpu-memory-utilization 0.94 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 16384 \
+  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --async-scheduling
+```
+
+长上下文 / RAG 优先：
+
+```bash
+vllm serve /models/your-model \
+  --gpu-memory-utilization 0.94 \
+  --max-model-len 32768 \
+  --max-num-batched-tokens 16384 \
+  --max-num-seqs 64 \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --long-prefill-token-threshold 4096 \
+  --max-num-partial-prefills 2 \
+  --max-long-partial-prefills 1
+```
+
+## 核心结论
+
+你的 agent 的第一优先级应该围绕四个主旋钮闭环：
+
+`max_num_batched_tokens`、`max_num_seqs`、`gpu_memory_utilization`、`max_model_len`。
+
+第二层再控制：
+
+`enable_prefix_caching`、`enable_chunked_prefill`、`kv_cache_dtype`、`tensor_parallel_size`、`pipeline_parallel_size`、`data_parallel_size`、`renderer_num_workers`、`api_server_count`。
+
+最重要的调参方向是：
+
+* **TTFT 高**：增大 `max_num_batched_tokens`，优化 prefill，开 prefix cache。
+* **ITL 高**：减小 `max_num_batched_tokens`，减少 decode 被 prefill 干扰。
+* **preemption 多**：增大 KV cache 空间或降低 batch 并发。
+* **吞吐低且 GPU 不满**：增大 batch，排查 CPU/tokenizer/frontend。
+* **多卡扩展差**：减少不必要 TP，优先 DP/多实例；MoE 用 EP。
+
+[1]: https://docs.vllm.ai/en/stable/configuration/optimization/ "Optimization and Tuning - vLLM"
+[2]: https://docs.vllm.ai/en/latest/cli/serve/ "vllm serve - vLLM"
+[3]: https://docs.vllm.ai/en/stable/design/prefix_caching/ "Automatic Prefix Caching - vLLM"
+[4]: https://docs.vllm.ai/en/stable/configuration/engine_args/ "Engine Arguments - vLLM"
+[5]: https://docs.vllm.ai/en/latest/configuration/serve_args/ "Server Arguments - vLLM"

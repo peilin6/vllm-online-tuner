@@ -132,5 +132,5 @@ def reflect(
         raw = json.loads(content)
         return ReflectionResult.from_dict(raw)
     except (ParseError, json.JSONDecodeError, RuntimeError) as e:
-        logger.warning("R-LLM 失败，走 fallback: %s", e)
+        logger.warning("R-LLM 失败，走 fallback: %s | raw=%r", e, locals().get("content"))
         return _fallback_reflect(proposal, prev, new, constraint_check)

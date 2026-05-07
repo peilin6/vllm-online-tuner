@@ -1,0 +1,15 @@
+{
+  "name": "profile_T",
+  "description": "A6000 + Qwen3-8B 高吞吐 profile",
+  "server": {
+    "max_num_seqs": 128,
+    "gpu_memory_utilization": 0.90,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true
+  },
+  "model": {
+    "max_model_len": 4096,
+    "dtype": "bfloat16",
+    "quantization": null
+  }
+}

@@ -160,14 +160,16 @@ def test_llm_malformed_json_falls_back():
 
 
 def test_llm_strips_markdown_fence():
-    raw = {"param": "max_num_seqs", "new_value": 16, "old_value": 32}
+    # underutilized -> max_num_seqs direction=up, 32 -> 64 是合法的
+    raw = {"param": "max_num_seqs", "new_value": 64, "old_value": 32,
+           "reason": "x", "expected_effect": {}}
     content = f"```json\n{json.dumps(raw)}\n```"
     client = FakeClient(content)
     mem = _mem({"max_num_seqs": 32})
     res = propose(client, FakeTools(), mem, _diag(),
                   current_config={"max_num_seqs": 32})
     assert isinstance(res, ConfigDelta)
-    assert res.new_value == 16
+    assert res.new_value == 64
 
 
 def test_llm_runtime_error_falls_back():

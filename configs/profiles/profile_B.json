@@ -1,0 +1,15 @@
+{
+  "name": "profile_B",
+  "description": "A6000 + Qwen3-8B 平衡 profile（默认）",
+  "server": {
+    "max_num_seqs": 64,
+    "gpu_memory_utilization": 0.90,
+    "enable_prefix_caching": false,
+    "enable_chunked_prefill": true
+  },
+  "model": {
+    "max_model_len": 4096,
+    "dtype": "bfloat16",
+    "quantization": null
+  }
+}
